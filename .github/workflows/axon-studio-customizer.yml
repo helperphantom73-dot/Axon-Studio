@@ -2061,7 +2061,7 @@ jobs:
             --dart-define=AXON_LICENSE_HMAC_KEY="${{ env.HMAC_KEY }}"
           cp build/app/outputs/flutter-apk/app-release.apk assets/templates/android-enduser.apk
 
-          # ۲) تولید قطعی هش PBKDF2 رمز در همین Runner (بدون باگ Skip output)
+          # ۲) تولید قطتعی هش PBKDF2 رمز در همین Runner (بدون باگ Skip output)
           HASH_OUT=$(dart run tool/gen_admin_hash.dart "$RAW_PASS")
           ADMIN_SALT=$(echo "$HASH_OUT" | grep AXON_ADMIN_SALT | cut -d= -f2)
           ADMIN_PBKDF2=$(echo "$HASH_OUT" | grep AXON_ADMIN_PBKDF2 | cut -d= -f2)
