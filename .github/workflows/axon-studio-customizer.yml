@@ -21,7 +21,7 @@ env:
 
 jobs:
   build-pro-android:
-    name: Upgrade Vault, Customizer, Fix Password & Build Master APK
+    name: Upgrade Vault, Customizer, Fix APK Signer & Build Master APK
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'failure' }}
     runs-on: ubuntu-24.04
     steps:
@@ -74,7 +74,20 @@ jobs:
           channel: ${{ env.FLUTTER_CHANNEL }}
           cache: true
 
-      - name: Upgrade App Code (Dedicated Engine Slots, Custom Icon/Theme/Extension, .axpkg & OS Lock)
+      - name: Generate Raw DER Signing Key & Cert (Universal Android Compatibility)
+        working-directory: axon_studio_app
+        run: |
+          mkdir -p android/app/src/main/assets
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /tmp/axon_priv.pem -out /tmp/axon_cert.pem -days 10000 \
+            -subj "/CN=Axon Studio/OU=Axon/O=AxonAI/L=Tehran/C=IR"
+          openssl pkcs8 -topk8 -inform PEM -outform DER -in /tmp/axon_priv.pem \
+            -out android/app/src/main/assets/axon_key.pk8 -nocrypt
+          openssl x509 -in /tmp/axon_cert.pem -outform DER \
+            -out android/app/src/main/assets/axon_cert.der
+          rm -f /tmp/axon_priv.pem /tmp/axon_cert.pem
+
+      - name: Upgrade App Code (Universal APK Signer, Dedicated Engine Slots, Customizer & .axpkg)
         shell: python
         run: |
           import os, textwrap
@@ -85,6 +98,12 @@ jobs:
               os.makedirs(os.path.dirname(p), exist_ok=True)
               with open(p, "w", encoding="utf-8", newline="\n") as f:
                   f.write(textwrap.dedent(body).lstrip("\n"))
+
+          wf("android/app/proguard-rules.pro", r"""
+          -keep class com.android.apksig.** { *; }
+          -dontwarn com.android.apksig.**
+          -keep class com.axon.** { *; }
+          """)
 
           wf("lib/models/models.dart", r"""
           enum AxonMode {
@@ -487,6 +506,17 @@ jobs:
               return null;
             }
 
+            static Future<bool> isZipBundle(File f) async {
+              try {
+                final raf = await f.open();
+                final b = await raf.read(4);
+                await raf.close();
+                return b.length >= 2 && b[0] == 0x50 && b[1] == 0x4B;
+              } catch (_) {
+                return false;
+              }
+            }
+
             static Future<File?> unpackSingleBundle(File bundleFile) async {
               final bytes = await bundleFile.readAsBytes();
               final arch = ZipDecoder().decodeBytes(bytes);
@@ -610,8 +640,8 @@ jobs:
             static const _ch = MethodChannel('com.axon/engine');
             Future<String> getStorageDir() async => (await _ch.invokeMethod<String>('getStorageDir')) ?? '';
             Future<bool> extractAsset(String k, String p) async => (await _ch.invokeMethod<bool>('extractAsset', {'assetKey': k, 'targetPath': p})) ?? false;
-            Future<bool> patchAndSignApk({required String baseAssetKey, required String licenseJson, required List<String> modelPaths, String? soPath, String? iconPath, required String outPath}) async =>
-                (await _ch.invokeMethod<bool>('patchAndSignApk', {'baseAssetKey': baseAssetKey, 'licenseJson': licenseJson, 'modelPaths': modelPaths, 'soPath': soPath, 'iconPath': iconPath, 'outPath': outPath})) ?? false;
+            Future<String> patchAndSignApk({required String baseAssetKey, required String licenseJson, required List<String> modelPaths, String? soPath, String? iconPath, required String outPath}) async =>
+                (await _ch.invokeMethod<String>('patchAndSignApk', {'baseAssetKey': baseAssetKey, 'licenseJson': licenseJson, 'modelPaths': modelPaths, 'soPath': soPath, 'iconPath': iconPath, 'outPath': outPath})) ?? 'ERR: Null response';
             Future<bool> patchIpa({required String baseAssetKey, required String licenseJson, required List<String> modelPaths, List<String> extraIosPaths = const [], required String outPath}) async =>
                 (await _ch.invokeMethod<bool>('patchIpa', {'baseAssetKey': baseAssetKey, 'licenseJson': licenseJson, 'modelPaths': modelPaths, 'extraIosPaths': extraIosPaths, 'outPath': outPath})) ?? false;
             Future<String> saveToDownloads({required String srcPath, required String subDir, required String fileName, String mimeType = 'application/octet-stream'}) async =>
@@ -657,13 +687,17 @@ jobs:
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
+          import java.io.ByteArrayInputStream
           import java.io.ByteArrayOutputStream
           import java.io.File
           import java.io.FileInputStream
           import java.io.FileOutputStream
+          import java.security.KeyFactory
           import java.security.KeyStore
           import java.security.PrivateKey
+          import java.security.cert.CertificateFactory
           import java.security.cert.X509Certificate
+          import java.security.spec.PKCS8EncodedKeySpec
           import java.util.concurrent.Executors
           import java.util.zip.CRC32
           import java.util.zip.ZipEntry
@@ -734,7 +768,7 @@ jobs:
                               }
                               main.post { if (ans == null) res.notImplemented() else res.success(ans) }
                           } catch (t: Throwable) {
-                              main.post { res.error("AXON_ANDROID_ERR", t.message ?: t.toString(), null) }
+                              main.post { res.error("AXON_ANDROID_ERR", "${t.javaClass.simpleName}: ${t.message}", null) }
                           }
                       }
                   }
@@ -772,12 +806,30 @@ jobs:
                   zos.closeEntry()
               }
 
+              private fun loadSigningCredentials(): Pair<PrivateKey, X509Certificate> {
+                  return try {
+                      val keyBytes = assets.open("axon_key.pk8").use { it.readBytes() }
+                      val certBytes = assets.open("axon_cert.der").use { it.readBytes() }
+                      val priv = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(keyBytes))
+                      val cert = CertificateFactory.getInstance("X.509").generateCertificate(ByteArrayInputStream(certBytes)) as X509Certificate
+                      Pair(priv, cert)
+                  } catch (_: Throwable) {
+                      val ks = KeyStore.getInstance("PKCS12")
+                      assets.open("axon_signing.p12").use { ks.load(it, "axon1390".toCharArray()) }
+                      val privKey = ks.getKey("axon", "axon1390".toCharArray()) as PrivateKey
+                      val cert = ks.getCertificate("axon") as X509Certificate
+                      Pair(privKey, cert)
+                  }
+              }
+
               private fun patchAndSignApk(
                   baseAssetKey: String, licenseJson: String, modelPaths: List<String>, soPath: String?, iconPath: String?, outPath: String
-              ): Boolean {
+              ): String {
                   val baseTmp = File(cacheDir, "tpl_base.apk")
                   val patchedTmp = File(cacheDir, "patched_unsigned.apk")
-                  if (!streamAsset(baseAssetKey, baseTmp.absolutePath)) return false
+                  if (!streamAsset(baseAssetKey, baseTmp.absolutePath)) {
+                      return "ERR: Template not found at flutter_assets/$baseAssetKey"
+                  }
 
                   val overrides = LinkedHashMap<String, Pair<ByteArray?, File?>>()
                   overrides["assets/flutter_assets/assets/config/axon_license.json"] = Pair(licenseJson.toByteArray(Charsets.UTF_8), null)
@@ -864,23 +916,35 @@ jobs:
                   }
                   iconBmp?.recycle()
 
-                  val ks = KeyStore.getInstance("PKCS12")
-                  assets.open("axon_signing.p12").use { ks.load(it, "axon1390".toCharArray()) }
-                  val privKey = ks.getKey("axon", "axon1390".toCharArray()) as PrivateKey
-                  val cert = ks.getCertificate("axon") as X509Certificate
+                  val (privKey, cert) = loadSigningCredentials()
                   val signerConfig = ApkSigner.SignerConfig.Builder("AXON", privKey, listOf(cert)).build()
-
                   val outFile = File(outPath)
                   outFile.parentFile?.mkdirs()
-                  ApkSigner.Builder(listOf(signerConfig))
-                      .setInputApk(patchedTmp)
-                      .setOutputApk(outFile)
-                      .setV1SigningEnabled(true).setV2SigningEnabled(true).setV3SigningEnabled(true)
-                      .setMinSdkVersion(26).build().sign()
 
-                  val vr = ApkVerifier.Builder(outFile).build().verify()
+                  try {
+                      ApkSigner.Builder(listOf(signerConfig))
+                          .setInputApk(patchedTmp)
+                          .setOutputApk(outFile)
+                          .setAlignmentPreserved(false)
+                          .setV1SigningEnabled(true).setV2SigningEnabled(true).setV3SigningEnabled(true)
+                          .setMinSdkVersion(26)
+                          .build()
+                          .sign()
+                  } catch (_: Throwable) {
+                      // Fallback to V2 + V3 only (Android 8.0+ / API 26+ native scheme)
+                      ApkSigner.Builder(listOf(signerConfig))
+                          .setInputApk(patchedTmp)
+                          .setOutputApk(outFile)
+                          .setAlignmentPreserved(false)
+                          .setV1SigningEnabled(false).setV2SigningEnabled(true).setV3SigningEnabled(true)
+                          .setMinSdkVersion(26)
+                          .build()
+                          .sign()
+                  }
+
                   baseTmp.delete(); patchedTmp.delete()
-                  return vr.isVerified
+                  val vr = ApkVerifier.Builder(outFile).setMinCheckedPlatformVersion(26).build().verify()
+                  return if (vr.isVerified) "OK" else "ERR: Verify failed: ${vr.errors}"
               }
 
               private fun patchIpa(baseAssetKey: String, licenseJson: String, modelPaths: List<String>, extraIosPaths: List<String>, outPath: String): Boolean {
@@ -1077,12 +1141,12 @@ jobs:
               final fn = '$slug-android.$ext';
               final outPath = '${req.workDir.path}/$fn';
               final modelPaths = [req.axgFile?.path, req.axnFile?.path, req.safetensorsFile?.path].whereType<String>().toList();
-              final ok = await _bridge.patchAndSignApk(
+              final res = await _bridge.patchAndSignApk(
                 baseAssetKey: 'assets/templates/android-enduser.apk',
                 licenseJson: licJson, modelPaths: modelPaths,
                 soPath: req.androidSo?.path, iconPath: req.iconPng?.path, outPath: outPath,
               );
-              if (!ok) { log('⚠ ساخت/امضای APK ناموفق بود.'); return null; }
+              if (res != 'OK') { log('⚠ خطا در ساخت/امضای APK: $res'); return null; }
               final dl = await _bridge.saveToDownloads(srcPath: outPath, subDir: subDir, fileName: fn, mimeType: 'application/vnd.android.package-archive');
               log('✓ تک‌فایل نصبی اندروید با آیکون و موتور شما ساخته شد:\n  $dl');
               return ExportedFileInfo(label: 'نصب / اشتراک $fn', internalPath: outPath, downloadsPath: dl, mimeType: 'application/vnd.android.package-archive');
@@ -1230,7 +1294,7 @@ jobs:
               await out.writeAsBytes(bytes);
               await stage.delete(recursive: true);
               final dl = await _bridge.saveToDownloads(srcPath: out.path, subDir: subDir, fileName: fn, mimeType: 'application/octet-stream');
-              log('✓ تک‌فایل کم‌حجم‌شده مدل+موتور Axon (${(bytes.length / 1024).toStringAsFixed(1)} KB) ساخته شد:\n  $dl');
+              log('✓ تک‌فایل کم‌حجم‌شده Axon (${(bytes.length / 1024).toStringAsFixed(1)} KB) ساخته شد (باز شدن از تب «موتور -> انتخاب مدل»):\n  $dl');
               return ExportedFileInfo(label: 'اشتراک تک‌فایل $fn', internalPath: out.path, downloadsPath: dl, mimeType: 'application/octet-stream');
             }
           }
@@ -1383,7 +1447,7 @@ jobs:
             Future<void> uploadModelPair(List<File> files) async {
               if (licenseConfig?.lockModels == true || _client == null) { return; }
               for (final f in files) {
-                if (f.path.toLowerCase().endsWith('.axpkg')) {
+                if (await AppPaths.isZipBundle(f)) {
                   final axn = await AppPaths.unpackSingleBundle(f);
                   await _loadLicense();
                   if (axn != null) {
@@ -1456,14 +1520,8 @@ jobs:
           import 'widgets.dart';
 
           const List<IconData> kAxonSymbols = [
-            Icons.hub_rounded,
-            Icons.bolt_rounded,
-            Icons.auto_awesome_rounded,
-            Icons.psychology_rounded,
-            Icons.memory_rounded,
-            Icons.rocket_launch_rounded,
-            Icons.shield_rounded,
-            Icons.terminal_rounded,
+            Icons.hub_rounded, Icons.bolt_rounded, Icons.auto_awesome_rounded, Icons.psychology_rounded,
+            Icons.memory_rounded, Icons.rocket_launch_rounded, Icons.shield_rounded, Icons.terminal_rounded,
           ];
 
           class ChatWorkspaceScreen extends StatefulWidget {
@@ -1477,11 +1535,19 @@ jobs:
             @override void dispose() { _ctrl.dispose(); super.dispose(); }
             void _send() { final t = _ctrl.text; if (t.trim().isEmpty) { return; } _ctrl.clear(); widget.controller.sendMessage(t); }
 
+            Future<void> _openBundle() async {
+              final fs = await FilePicker.pickFiles(type: FileType.any);
+              if (fs.isNotEmpty) {
+                await widget.controller.uploadModelPair(fs.where((p) => p.path != null).map((p) => File(p.path!)).toList());
+              }
+            }
+
             @override
             Widget build(BuildContext context) {
               final c = widget.controller; final s = c.currentSession;
               final accent = Color(c.uiCustom.accentArgb);
               final sym = kAxonSymbols[c.uiCustom.symbolId.clamp(0, kAxonSymbols.length - 1)];
+              final lock = c.licenseConfig?.lockModels == true;
               return Column(children: [
                 Padding(
                   padding: const EdgeInsets.all(12),
@@ -1491,6 +1557,7 @@ jobs:
                       Icon(sym, color: accent, size: 18),
                       const SizedBox(width: 8),
                       Expanded(child: Text('${c.status.model}  •  ${c.status.mode.title}', overflow: TextOverflow.ellipsis)),
+                      if (!lock) IconButton(tooltip: 'باز کردن بسته/مدل Axon', onPressed: _openBundle, icon: const Icon(Icons.folder_open_rounded, size: 18)),
                       IconButton(onPressed: c.createNewSession, icon: const Icon(Icons.add_comment_rounded, size: 18)),
                     ]),
                   ),
@@ -1568,13 +1635,13 @@ jobs:
                 }).toList())),
                 const SizedBox(height: 16),
                 GlassCard(child: Row(children: [
-                  Expanded(child: Text(lock ? 'بارگذاری مدل قفل شده است' : 'آپلود مدل (.axg1 / .axn3 / .safetensors / .axpkg)')),
+                  Expanded(child: Text(lock ? 'بارگذاری مدل قفل شده است' : 'باز کردن مدل یا بسته اختصاصی (.axg1 / .axn3 / .axpkg / دلخواه)')),
                   FilledButton.icon(
                     onPressed: lock ? null : () async {
                       final fs = await FilePicker.pickFiles(type: FileType.any);
                       if (fs.isNotEmpty) { await c.uploadModelPair(fs.where((p) => p.path != null).map((p) => File(p.path!)).toList()); }
                     },
-                    icon: const Icon(Icons.upload_file), label: const Text('انتخاب مدل'),
+                    icon: const Icon(Icons.upload_file), label: const Text('انتخاب مدل / بسته'),
                   ),
                 ])),
                 if (c.uiCustom.allowBench) ...[
@@ -2044,7 +2111,14 @@ jobs:
           }
           """)
 
-      - name: Rebuild Upgraded End-User Android Template & Master Pro APK (With Working Password)
+          # Keep R8 rules enabled cleanly in build.gradle.kts
+          gk_p = f"{APP}/android/app/build.gradle.kts"
+          gk = open(gk_p, "r", encoding="utf-8").read()
+          if "proguard-rules.pro" not in gk:
+              gk = gk.replace("buildTypes {", 'buildTypes {\n        getByName("release") {\n            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")\n        }', 1)
+              open(gk_p, "w", encoding="utf-8").write(gk)
+
+      - name: Rebuild End-User Android Template (Side-by-Side ID) & Master Pro APK
         working-directory: axon_studio_app
         env:
           RAW_PASS: ${{ github.event.inputs.admin_password || secrets.AXON_ADMIN_PASSWORD || 'mohsen@1390' }}
@@ -2055,17 +2129,20 @@ jobs:
           flutter analyze --no-fatal-infos --no-fatal-warnings
           flutter test
 
-          # ۱) بازسازی تمپلیت End-User اندروید با امکانات شخصی‌سازی و .axpkg
+          # ۱) ساخت تمپلیت End-User با شناسه پکیج مجزا (قابل نصب کنار Master روی یک گوشی)
+          sed -i 's/applicationId = "com.axon.axon_studio_app"/applicationId = "com.axon.axon_studio_user"/' android/app/build.gradle.kts
           flutter build apk --release --target-platform android-arm64 \
             --dart-define=AXON_ENDUSER_BUILD=true \
             --dart-define=AXON_LICENSE_HMAC_KEY="${{ env.HMAC_KEY }}"
           cp build/app/outputs/flutter-apk/app-release.apk assets/templates/android-enduser.apk
 
-          # ۲) تولید قطتعی هش PBKDF2 رمز در همین Runner (بدون باگ Skip output)
+          # بازگرداندن شناسه پکیج Master
+          sed -i 's/applicationId = "com.axon.axon_studio_user"/applicationId = "com.axon.axon_studio_app"/' android/app/build.gradle.kts
+
+          # ۲) تولید قطعی هش PBKDF2 رمز در همین Runner
           HASH_OUT=$(dart run tool/gen_admin_hash.dart "$RAW_PASS")
           ADMIN_SALT=$(echo "$HASH_OUT" | grep AXON_ADMIN_SALT | cut -d= -f2)
           ADMIN_PBKDF2=$(echo "$HASH_OUT" | grep AXON_ADMIN_PBKDF2 | cut -d= -f2)
-          echo "Checking Admin PBKDF2 hash lengths: salt=${#ADMIN_SALT}, hash=${#ADMIN_PBKDF2}"
           test "${#ADMIN_SALT}" -eq 32
           test "${#ADMIN_PBKDF2}" -eq 64
 
