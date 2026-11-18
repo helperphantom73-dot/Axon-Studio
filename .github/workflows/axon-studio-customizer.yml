@@ -1,0 +1,2088 @@
+name: Axon Studio v12 — Pro Customizer & Engine Vault (Addon)
+
+on:
+  workflow_run:
+    workflows: ["Axon Studio v12 — Android Master (Builds All-OS Outputs On-Device)"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      admin_password:
+        description: 'Admin Builder Password'
+        required: false
+        default: 'mohsen@1390'
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  FLUTTER_CHANNEL: 'stable'
+  HMAC_KEY: ${{ secrets.AXON_LICENSE_HMAC_KEY || 'AXON_V12_MASTER_HMAC_KEY_CHANGE_ME_IN_CI' }}
+
+jobs:
+  build-pro-android:
+    name: Upgrade Vault, Customizer, Fix Password & Build Master APK
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'failure' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Locate Latest Main Workflow Run ID
+        id: find_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            RUN_ID="${{ github.event.workflow_run.id }}"
+          else
+            RUN_ID=$(gh run list --repo "${{ github.repository }}" \
+              --workflow "Axon Studio v12 — Android Master (Builds All-OS Outputs On-Device)" \
+              --limit 10 --json databaseId,conclusion \
+              --jq '[.[] | select(.conclusion=="success")][0].databaseId // empty')
+          fi
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR: Run the main axon-studio.yml workflow first so templates are available."
+            exit 1
+          fi
+          echo "Using template run ID: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download Base Source From Main Workflow
+        uses: actions/download-artifact@v4
+        with:
+          name: axon-source
+          path: axon_studio_app
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find_run.outputs.run_id }}
+
+      - name: Download Desktop & iOS Templates From Main Workflow
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tpl-*
+          merge-multiple: true
+          path: axon_studio_app/assets/templates
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find_run.outputs.run_id }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Upgrade App Code (Dedicated Engine Slots, Custom Icon/Theme/Extension, .axpkg & OS Lock)
+        shell: python
+        run: |
+          import os, textwrap
+
+          APP = "axon_studio_app"
+          def wf(rel, body):
+              p = os.path.join(APP, rel)
+              os.makedirs(os.path.dirname(p), exist_ok=True)
+              with open(p, "w", encoding="utf-8", newline="\n") as f:
+                  f.write(textwrap.dedent(body).lstrip("\n"))
+
+          wf("lib/models/models.dart", r"""
+          enum AxonMode {
+            fp4('fp4', 'FP4 + Outliers', 'کوانتایز ۴ بیتی با حفظ وزن‌های کلیدی'),
+            brain('brain', 'Brain-Routed Sparse', 'مسیریابی هوشمند ماتریس‌های sig_*'),
+            ternary('ternary', 'Ternary 1.58-bit', 'وزن‌های سه‌حالته فوق‌سریع'),
+            f32('f32', 'Dense F32', 'دقت کامل ممیز شناور ۳۲ بیتی'),
+            gpu('gpu', 'OpenCL GPU', 'شتاب‌دهی کارت گرافیک OpenCL');
+            final String wire, title, subtitleFa;
+            const AxonMode(this.wire, this.title, this.subtitleFa);
+            static AxonMode fromWire(String v) => AxonMode.values.firstWhere((m) => m.wire == v.toLowerCase(), orElse: () => AxonMode.fp4);
+          }
+
+          enum VaultSlot {
+            winEngine('win_engine', 'موتور Windows (.exe)', 'axon-studio.exe'),
+            linuxEngine('linux_engine', 'موتور Linux x86_64', 'axon-studio'),
+            macEngine('mac_engine', 'موتور macOS', 'axon-studio'),
+            androidSo('android_so', 'موتور Android (.so)', 'libaxon_android_arm64.so'),
+            androidSdk('android_sdk', 'SDK اندروید (JNI / Kt / .h)', 'axon_mobile_jni.c'),
+            iosArm64('ios_arm64', 'کتابخانه iOS ARM64 (.a)', 'libaxon_ios_arm64.a'),
+            iosSim('ios_sim', 'کتابخانه iOS Sim (.a)', 'libaxon_ios_sim_arm64.a'),
+            iosSdk('ios_sdk', 'SDK آیفون (Swift / modulemap)', 'AxonEngine.swift'),
+            modelAxg('model_axg', 'گراف مدل Axon (.axg1)', 'mini_llm.axg1'),
+            modelAxn('model_axn', 'وزن فشرده (.axn3 / .safetensors)', 'mini_llm.axn3');
+            final String id, titleFa, hintFile;
+            const VaultSlot(this.id, this.titleFa, this.hintFile);
+            static VaultSlot fromId(String v) => VaultSlot.values.firstWhere((s) => s.id == v, orElse: () => VaultSlot.modelAxn);
+          }
+
+          class EngineStatus {
+            final String edition, model, format, openclDevice;
+            final bool isServer, quotaLocked;
+            final int quotaUsedS, rawBytes, activeBytes;
+            final AxonMode mode;
+            final double ramSaved, flopsSkipped, lastMs;
+            const EngineStatus({
+              required this.edition, required this.isServer, required this.quotaUsedS, required this.quotaLocked,
+              required this.model, required this.format, required this.mode, required this.rawBytes,
+              required this.activeBytes, required this.ramSaved, required this.flopsSkipped, required this.lastMs, required this.openclDevice,
+            });
+            factory EngineStatus.empty() => const EngineStatus(
+              edition: 'offline', isServer: false, quotaUsedS: 0, quotaLocked: false, model: 'none', format: '-',
+              mode: AxonMode.fp4, rawBytes: 0, activeBytes: 0, ramSaved: 0, flopsSkipped: 0, lastMs: 0, openclDevice: 'Detecting...',
+            );
+            factory EngineStatus.fromJson(Map<String, dynamic> j) => EngineStatus(
+              edition: (j['edition'] ?? 'standard').toString(), isServer: j['is_server'] == true,
+              quotaUsedS: (j['quota_used_s'] as num?)?.toInt() ?? 0, quotaLocked: j['quota_locked'] == true,
+              model: (j['model'] ?? 'none').toString(), format: (j['format'] ?? '-').toString(),
+              mode: AxonMode.fromWire((j['mode'] ?? 'fp4').toString()),
+              rawBytes: (j['raw_bytes'] as num?)?.toInt() ?? 0, activeBytes: (j['active_bytes'] as num?)?.toInt() ?? 0,
+              ramSaved: (j['ram_saved'] as num?)?.toDouble() ?? 0, flopsSkipped: (j['flops_skipped'] as num?)?.toDouble() ?? 0,
+              lastMs: (j['last_ms'] as num?)?.toDouble() ?? 0, openclDevice: (j['opencl_device'] ?? 'CPU SIMD').toString(),
+            );
+          }
+
+          class BenchResult {
+            final double cpuMs, gpuMs, cpuGflops, gpuGflops, speedup;
+            final String openclDevice;
+            const BenchResult({required this.cpuMs, required this.gpuMs, required this.cpuGflops, required this.gpuGflops, required this.speedup, required this.openclDevice});
+            factory BenchResult.fromJson(Map<String, dynamic> j) => BenchResult(
+              cpuMs: (j['cpu_ms'] as num?)?.toDouble() ?? 0, gpuMs: (j['gpu_ms'] as num?)?.toDouble() ?? 0,
+              cpuGflops: (j['cpu_gflops'] as num?)?.toDouble() ?? 0, gpuGflops: (j['gpu_gflops'] as num?)?.toDouble() ?? 0,
+              speedup: (j['speedup'] as num?)?.toDouble() ?? 1, openclDevice: (j['opencl_device'] ?? 'CPU').toString(),
+            );
+          }
+
+          class ChatMessage {
+            final String id, text;
+            final bool isUser;
+            final double? latencyMs, tokPerSec;
+            final int? tokens, kvUsed, kvMax;
+            final DateTime timestamp;
+            const ChatMessage({required this.id, required this.isUser, required this.text, this.latencyMs, this.tokPerSec, this.tokens, this.kvUsed, this.kvMax, required this.timestamp});
+            Map<String, dynamic> toJson() => {'id': id, 'isUser': isUser, 'text': text, 'latencyMs': latencyMs, 'tokPerSec': tokPerSec, 'tokens': tokens, 'kvUsed': kvUsed, 'kvMax': kvMax, 'timestamp': timestamp.toIso8601String()};
+            factory ChatMessage.fromJson(Map<String, dynamic> j) => ChatMessage(
+              id: j['id'].toString(), isUser: j['isUser'] == true, text: j['text'].toString(),
+              latencyMs: (j['latencyMs'] as num?)?.toDouble(), tokPerSec: (j['tokPerSec'] as num?)?.toDouble(),
+              tokens: (j['tokens'] as num?)?.toInt(), kvUsed: (j['kvUsed'] as num?)?.toInt(), kvMax: (j['kvMax'] as num?)?.toInt(),
+              timestamp: DateTime.tryParse(j['timestamp']?.toString() ?? '') ?? DateTime.now(),
+            );
+          }
+
+          class ChatSession {
+            final String id, title;
+            final DateTime updatedAt;
+            final List<ChatMessage> messages;
+            const ChatSession({required this.id, required this.title, required this.updatedAt, required this.messages});
+            Map<String, dynamic> toJson() => {'id': id, 'title': title, 'updatedAt': updatedAt.toIso8601String(), 'messages': messages.map((m) => m.toJson()).toList()};
+            factory ChatSession.fromJson(Map<String, dynamic> j) => ChatSession(
+              id: j['id'].toString(), title: j['title'].toString(),
+              updatedAt: DateTime.tryParse(j['updatedAt']?.toString() ?? '') ?? DateTime.now(),
+              messages: ((j['messages'] as List?) ?? []).map((e) => ChatMessage.fromJson(Map<String, dynamic>.from(e as Map))).toList(),
+            );
+          }
+
+          enum QuotaScope {
+            serverOnly('server_only', 'فقط محدود در سرورها'),
+            allDevices('all_devices', 'محدود در همه دستگاه‌ها'),
+            unlimitedPro('unlimited_pro', 'کاملاً نامحدود (Pro)');
+            final String wire, labelFa;
+            const QuotaScope(this.wire, this.labelFa);
+            static QuotaScope fromWire(String v) => QuotaScope.values.firstWhere((s) => s.wire == v, orElse: () => QuotaScope.serverOnly);
+          }
+
+          enum BuildTarget {
+            android('android', 'Android (تک‌فایل نصبی)', 'apk'),
+            windows('windows', 'Windows (تک‌فایل خوداجرا)', 'exe'),
+            linux('linux', 'Linux (تک‌فایل GUI)', 'bin'),
+            macos('macos', 'macOS (بسته .app)', 'app.tar.gz'),
+            ios('ios', 'iOS (بسته .ipa)', 'ipa'),
+            axpkg('axpkg', 'تک‌فایل کم‌حجم مدل+موتور Axon', 'axpkg');
+            final String id, title, defaultExt;
+            const BuildTarget(this.id, this.title, this.defaultExt);
+          }
+
+          class UiCustomConfig {
+            final int accentArgb, bgArgb, symbolId;
+            final bool allowChat, allowBench, allowServer, defaultRtl, hasCustomIcon;
+            final String welcomeText;
+            final List<String> allowedOs;
+
+            const UiCustomConfig({
+              this.accentArgb = 0xFF00E5FF,
+              this.bgArgb = 0xFF090B10,
+              this.symbolId = 0,
+              this.allowChat = true,
+              this.allowBench = true,
+              this.allowServer = true,
+              this.defaultRtl = true,
+              this.hasCustomIcon = false,
+              this.welcomeText = 'موتور Axon v12.0 آماده گفتگوی آفلاین است',
+              this.allowedOs = const ['android', 'windows', 'linux', 'macos', 'ios'],
+            });
+
+            Map<String, dynamic> toJson() => {
+              'accent_argb': accentArgb,
+              'bg_argb': bgArgb,
+              'symbol_id': symbolId,
+              'allow_chat': allowChat,
+              'allow_bench': allowBench,
+              'allow_server': allowServer,
+              'default_rtl': defaultRtl,
+              'has_custom_icon': hasCustomIcon,
+              'welcome_text': welcomeText,
+              'allowed_os_csv': allowedOs.join(','),
+            };
+
+            factory UiCustomConfig.fromJson(Map<String, dynamic> j) => UiCustomConfig(
+              accentArgb: (j['accent_argb'] as num?)?.toInt() ?? 0xFF00E5FF,
+              bgArgb: (j['bg_argb'] as num?)?.toInt() ?? 0xFF090B10,
+              symbolId: (j['symbol_id'] as num?)?.toInt() ?? 0,
+              allowChat: j['allow_chat'] != false,
+              allowBench: j['allow_bench'] != false,
+              allowServer: j['allow_server'] != false,
+              defaultRtl: j['default_rtl'] != false,
+              hasCustomIcon: j['has_custom_icon'] == true,
+              welcomeText: (j['welcome_text'] ?? 'موتور Axon v12.0 آماده گفتگوی آفلاین است').toString(),
+              allowedOs: (j['allowed_os_csv'] ?? 'android,windows,linux,macos,ios').toString().split(',').where((e) => e.isNotEmpty).toList(),
+            );
+          }
+
+          class LicenseConfig {
+            final int version, maxTotalSeconds, maxWeeklySeconds, expiresUnix, issuedUnix;
+            final String brandName, edition, bundledAxg, bundledAxn, bundledSafetensors, nonce, signature;
+            final QuotaScope scope;
+            final bool lockModels, noTranspose;
+            final List<String> allowedModes;
+            final UiCustomConfig uiCustom;
+
+            const LicenseConfig({
+              this.version = 1, required this.brandName, required this.edition, required this.scope,
+              required this.maxTotalSeconds, required this.maxWeeklySeconds, required this.expiresUnix,
+              required this.lockModels, required this.allowedModes, this.bundledAxg = '', this.bundledAxn = '',
+              this.bundledSafetensors = '', this.noTranspose = false, required this.issuedUnix, required this.nonce,
+              this.signature = '', this.uiCustom = const UiCustomConfig(),
+            });
+
+            String canonicalPayload() => [
+              'AXON_LC_V1', brandName, edition, scope.wire, maxTotalSeconds, maxWeeklySeconds,
+              expiresUnix, lockModels ? 1 : 0, allowedModes.join(','), bundledAxg, bundledAxn, bundledSafetensors, issuedUnix, nonce,
+            ].join('|');
+
+            Map<String, dynamic> toJson() => {
+              'version': version, 'brand_name': brandName, 'edition': edition, 'scope': scope.wire,
+              'max_total_seconds': maxTotalSeconds, 'max_weekly_seconds': maxWeeklySeconds, 'expires_unix': expiresUnix,
+              'lock_models': lockModels, 'allowed_modes_csv': allowedModes.join(','), 'bundled_axg': bundledAxg,
+              'bundled_axn': bundledAxn, 'bundled_safetensors': bundledSafetensors, 'no_transpose': noTranspose,
+              'issued_unix': issuedUnix, 'nonce': nonce, 'signature': signature,
+              'ui_custom': uiCustom.toJson(),
+            };
+
+            factory LicenseConfig.fromJson(Map<String, dynamic> j) => LicenseConfig(
+              version: (j['version'] as num?)?.toInt() ?? 1, brandName: (j['brand_name'] ?? 'Axon Studio').toString(),
+              edition: (j['edition'] ?? 'standard').toString(), scope: QuotaScope.fromWire((j['scope'] ?? 'server_only').toString()),
+              maxTotalSeconds: (j['max_total_seconds'] as num?)?.toInt() ?? 0, maxWeeklySeconds: (j['max_weekly_seconds'] as num?)?.toInt() ?? 0,
+              expiresUnix: (j['expires_unix'] as num?)?.toInt() ?? 0, lockModels: j['lock_models'] == true,
+              allowedModes: (j['allowed_modes_csv'] ?? 'fp4,brain,ternary,f32,gpu').toString().split(',').where((e) => e.isNotEmpty).toList(),
+              bundledAxg: (j['bundled_axg'] ?? '').toString(), bundledAxn: (j['bundled_axn'] ?? '').toString(),
+              bundledSafetensors: (j['bundled_safetensors'] ?? '').toString(), noTranspose: j['no_transpose'] == true,
+              issuedUnix: (j['issued_unix'] as num?)?.toInt() ?? 0, nonce: (j['nonce'] ?? '').toString(), signature: (j['signature'] ?? '').toString(),
+              uiCustom: j['ui_custom'] is Map ? UiCustomConfig.fromJson(Map<String, dynamic>.from(j['ui_custom'] as Map)) : const UiCustomConfig(),
+            );
+
+            LicenseConfig withSignature(String sig) => LicenseConfig(
+              version: version, brandName: brandName, edition: edition, scope: scope, maxTotalSeconds: maxTotalSeconds,
+              maxWeeklySeconds: maxWeeklySeconds, expiresUnix: expiresUnix, lockModels: lockModels, allowedModes: allowedModes,
+              bundledAxg: bundledAxg, bundledAxn: bundledAxn, bundledSafetensors: bundledSafetensors, noTranspose: noTranspose,
+              issuedUnix: issuedUnix, nonce: nonce, signature: sig, uiCustom: uiCustom,
+            );
+          }
+
+          class VaultAsset {
+            final String id, name, slotId, storedPath;
+            final int sizeBytes;
+            final DateTime addedAt;
+            const VaultAsset({required this.id, required this.name, required this.slotId, required this.storedPath, required this.sizeBytes, required this.addedAt});
+            Map<String, dynamic> toJson() => {'id': id, 'name': name, 'slotId': slotId, 'storedPath': storedPath, 'sizeBytes': sizeBytes, 'addedAt': addedAt.toIso8601String()};
+            factory VaultAsset.fromJson(Map<String, dynamic> j) => VaultAsset(
+              id: j['id'].toString(), name: j['name'].toString(),
+              slotId: (j['slotId'] ?? j['category'] ?? 'model_axn').toString(),
+              storedPath: j['storedPath'].toString(), sizeBytes: (j['sizeBytes'] as num?)?.toInt() ?? 0,
+              addedAt: DateTime.tryParse(j['addedAt']?.toString() ?? '') ?? DateTime.now(),
+            );
+          }
+          """)
+
+          wf("lib/services/vault_service.dart", r"""
+          import 'dart:convert';
+          import 'dart:io';
+          import '../models/models.dart';
+          import 'engine_services.dart';
+
+          class VaultService {
+            List<VaultAsset> items = [];
+
+            Directory get vaultDir => Directory('${AppPaths.appDataDir().path}${Platform.pathSeparator}vault');
+            File get _indexFile => File('${vaultDir.path}${Platform.pathSeparator}vault_index_v2.json');
+
+            Future<void> load() async {
+              await vaultDir.create(recursive: true);
+              if (!await _indexFile.exists()) { items = []; return; }
+              try {
+                final list = jsonDecode(await _indexFile.readAsString()) as List;
+                items = list.map((e) => VaultAsset.fromJson(Map<String, dynamic>.from(e as Map))).toList();
+                items.removeWhere((x) => !File(x.storedPath).existsSync());
+              } catch (_) { items = []; }
+            }
+
+            Future<VaultAsset> importToSlot(File src, VaultSlot slot, {bool replaceSlot = true}) async {
+              await vaultDir.create(recursive: true);
+              final name = src.uri.pathSegments.where((e) => e.isNotEmpty).last;
+              final sub = Directory('${vaultDir.path}${Platform.pathSeparator}${slot.id}');
+              await sub.create(recursive: true);
+              if (replaceSlot && (slot != VaultSlot.androidSdk && slot != VaultSlot.iosSdk)) {
+                final prev = items.where((i) => i.slotId == slot.id).toList();
+                for (final p in prev) {
+                  final pf = File(p.storedPath);
+                  if (await pf.exists()) { await pf.delete(); }
+                }
+                items.removeWhere((i) => i.slotId == slot.id);
+              }
+              final dst = File('${sub.path}${Platform.pathSeparator}$name');
+              await src.copy(dst.path);
+              items.removeWhere((i) => i.slotId == slot.id && i.name == name);
+              final asset = VaultAsset(
+                id: '${slot.id}_$name', name: name, slotId: slot.id,
+                storedPath: dst.path, sizeBytes: await dst.length(), addedAt: DateTime.now(),
+              );
+              items.add(asset);
+              await _save();
+              return asset;
+            }
+
+            VaultAsset? firstInSlot(VaultSlot slot) {
+              for (final a in items) {
+                if (a.slotId == slot.id) { return a; }
+              }
+              return null;
+            }
+
+            List<File> filesInSlot(VaultSlot slot) =>
+                items.where((a) => a.slotId == slot.id).map((a) => File(a.storedPath)).toList();
+
+            Future<void> deleteAsset(VaultAsset a) async {
+              final f = File(a.storedPath);
+              if (await f.exists()) { await f.delete(); }
+              items.removeWhere((i) => i.id == a.id);
+              await _save();
+            }
+
+            Future<void> _save() async {
+              await vaultDir.create(recursive: true);
+              await _indexFile.writeAsString(const JsonEncoder.withIndent('  ').convert(items.map((e) => e.toJson()).toList()), flush: true);
+            }
+          }
+          """)
+
+          wf("lib/services/engine_services.dart", r"""
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:archive/archive_io.dart';
+          import 'package:flutter/services.dart';
+          import '../models/models.dart';
+
+          class AppPaths {
+            static String? _mobileDataDir;
+
+            static void setMobileDataDir(String path) {
+              if (path.trim().isNotEmpty) { _mobileDataDir = path; }
+            }
+
+            static Directory appDataDir() {
+              if (_mobileDataDir != null && _mobileDataDir!.isNotEmpty) {
+                return Directory(_mobileDataDir!);
+              }
+              if (Platform.isAndroid || Platform.isIOS) {
+                return Directory('${Directory.systemTemp.path}${Platform.pathSeparator}AxonStudio');
+              }
+              final home = Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? Directory.systemTemp.path;
+              if (Platform.isWindows) { return Directory('${Platform.environment['LOCALAPPDATA'] ?? '$home\\AppData\\Local'}\\AxonStudio'); }
+              if (Platform.isMacOS) { return Directory('$home/Library/Application Support/AxonStudio'); }
+              return Directory('$home/.local/share/axon-studio');
+            }
+
+            static String currentOsId() {
+              if (Platform.isAndroid) { return 'android'; }
+              if (Platform.isWindows) { return 'windows'; }
+              if (Platform.isLinux) { return 'linux'; }
+              if (Platform.isMacOS) { return 'macos'; }
+              if (Platform.isIOS) { return 'ios'; }
+              return 'unknown';
+            }
+
+            static List<Directory> searchRoots() {
+              final list = <Directory>[
+                Directory('${appDataDir().path}${Platform.pathSeparator}vault${Platform.pathSeparator}model_axg'),
+                Directory('${appDataDir().path}${Platform.pathSeparator}vault${Platform.pathSeparator}model_axn'),
+                Directory('${appDataDir().path}${Platform.pathSeparator}vault${Platform.pathSeparator}win_engine'),
+                Directory('${appDataDir().path}${Platform.pathSeparator}vault${Platform.pathSeparator}linux_engine'),
+                Directory('${appDataDir().path}${Platform.pathSeparator}vault${Platform.pathSeparator}mac_engine'),
+                Directory('${appDataDir().path}${Platform.pathSeparator}imported_axpkg'),
+                appDataDir(),
+              ];
+              if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+                try {
+                  final exe = File(Platform.resolvedExecutable).parent;
+                  final sep = Platform.pathSeparator;
+                  list.addAll([
+                    exe,
+                    Directory('${exe.path}${sep}bin'),
+                    Directory('${exe.path}${sep}models'),
+                    Directory('${exe.path}$sep..${sep}Resources'),
+                    Directory('${exe.path}$sep..${sep}Resources${sep}bin'),
+                    Directory('${exe.path}$sep..${sep}Resources${sep}models'),
+                  ]);
+                } catch (_) {}
+              }
+              return list;
+            }
+
+            static Future<String?> findAxonBinary({bool preferPro = true}) async {
+              final names = Platform.isWindows ? [if (preferPro) 'axon-pro-studio.exe', 'axon-studio.exe'] : [if (preferPro) 'axon-pro-studio', 'axon-studio'];
+              for (final r in searchRoots()) {
+                for (final n in names) {
+                  try {
+                    final f = File('${r.path}${Platform.pathSeparator}$n');
+                    if (await f.exists()) { return f.path; }
+                  } catch (_) {}
+                }
+              }
+              return null;
+            }
+
+            static Future<File?> findModelFile(String filename) async {
+              if (filename.isEmpty) { return null; }
+              try {
+                if (await File(filename).exists()) { return File(filename); }
+              } catch (_) {}
+              for (final r in searchRoots()) {
+                try {
+                  final f = File('${r.path}${Platform.pathSeparator}$filename');
+                  if (await f.exists()) { return f; }
+                } catch (_) {}
+              }
+              return null;
+            }
+
+            static Future<String?> loadBundledLicenseJson() async {
+              for (final r in searchRoots()) {
+                try {
+                  final f = File('${r.path}${Platform.pathSeparator}axon_license.json');
+                  if (await f.exists()) { return await f.readAsString(); }
+                } catch (_) {}
+              }
+              try {
+                final t = await rootBundle.loadString('assets/config/axon_license.json');
+                if (t.trim().isNotEmpty) { return t; }
+              } catch (_) {}
+              return null;
+            }
+
+            static Future<File?> unpackSingleBundle(File bundleFile) async {
+              final bytes = await bundleFile.readAsBytes();
+              final arch = ZipDecoder().decodeBytes(bytes);
+              final dst = Directory('${appDataDir().path}${Platform.pathSeparator}imported_axpkg');
+              if (await dst.exists()) { await dst.delete(recursive: true); }
+              await dst.create(recursive: true);
+              File? firstAxn;
+              for (final e in arch) {
+                if (!e.isFile) { continue; }
+                final out = File('${dst.path}${Platform.pathSeparator}${e.name}');
+                await out.parent.create(recursive: true);
+                await out.writeAsBytes(e.readBytes() ?? []);
+                if (e.name.toLowerCase().endsWith('.axn3') || e.name.toLowerCase().endsWith('.safetensors')) {
+                  firstAxn ??= out;
+                }
+              }
+              return firstAxn;
+            }
+          }
+
+          class ChatResponse {
+            final String reply; final double ms, tokPerSec; final int tokens, kvUsed, kvMax; final bool quotaLocked;
+            const ChatResponse({required this.reply, required this.ms, required this.tokPerSec, required this.tokens, required this.kvUsed, required this.kvMax, required this.quotaLocked});
+            factory ChatResponse.fromJson(Map<String, dynamic> j) => ChatResponse(
+              reply: (j['reply'] ?? j['response'] ?? j['text'] ?? '').toString(),
+              ms: (j['ms'] as num?)?.toDouble() ?? (j['last_ms'] as num?)?.toDouble() ?? 0,
+              tokPerSec: (j['tok_per_sec'] as num?)?.toDouble() ?? 0,
+              tokens: (j['tokens'] as num?)?.toInt() ?? 0, kvUsed: (j['kv_used'] as num?)?.toInt() ?? 0,
+              kvMax: (j['kv_max'] as num?)?.toInt() ?? 4096, quotaLocked: j['quota_locked'] == true,
+            );
+          }
+
+          abstract class AxonEngineClient {
+            Future<EngineStatus> fetchStatus();
+            Future<bool> setMode(AxonMode mode);
+            Future<bool> uploadModelFile(File file);
+            Future<ChatResponse> sendChat(String prompt, {int maxTokens = 256, double temperature = 0.7});
+            Future<BenchResult> runBenchmark();
+            Future<void> resetKvCache();
+          }
+
+          class HttpAxonEngineClient implements AxonEngineClient {
+            final String baseUrl;
+            final HttpClient _http = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+            HttpAxonEngineClient(this.baseUrl);
+            String get _b => baseUrl.endsWith('/') ? baseUrl.substring(0, baseUrl.length - 1) : baseUrl;
+
+            @override
+            Future<EngineStatus> fetchStatus() async {
+              final r = await (await _http.getUrl(Uri.parse('$_b/api/status'))).close();
+              return EngineStatus.fromJson(Map<String, dynamic>.from(jsonDecode(await utf8.decodeStream(r)) as Map));
+            }
+            @override
+            Future<bool> setMode(AxonMode mode) async {
+              final r = await (await _http.postUrl(Uri.parse('$_b/api/mode?mode=${mode.wire}'))).close();
+              await r.drain<void>(); return r.statusCode == 200;
+            }
+            @override
+            Future<bool> uploadModelFile(File file) async {
+              final req = await _http.postUrl(Uri.parse('$_b/api/upload?name=${Uri.encodeComponent(file.uri.pathSegments.last)}'));
+              req.headers.set(HttpHeaders.contentTypeHeader, 'application/octet-stream');
+              await req.addStream(file.openRead());
+              final r = await req.close(); await r.drain<void>(); return r.statusCode == 200;
+            }
+            @override
+            Future<ChatResponse> sendChat(String prompt, {int maxTokens = 256, double temperature = 0.7}) async {
+              final req = await _http.postUrl(Uri.parse('$_b/api/chat'));
+              req.headers.contentType = ContentType.json;
+              req.write(jsonEncode({'prompt': prompt, 'max_tokens': maxTokens, 'temperature': temperature}));
+              final r = await req.close();
+              return ChatResponse.fromJson(Map<String, dynamic>.from(jsonDecode(await utf8.decodeStream(r)) as Map));
+            }
+            @override
+            Future<BenchResult> runBenchmark() async {
+              final r = await (await _http.getUrl(Uri.parse('$_b/api/bench'))).close();
+              return BenchResult.fromJson(Map<String, dynamic>.from(jsonDecode(await utf8.decodeStream(r)) as Map));
+            }
+            @override
+            Future<void> resetKvCache() async {}
+          }
+
+          class DesktopProcessManager {
+            Process? _proc; int? port; bool isServerMode = false;
+            bool get isRunning => _proc != null;
+
+            Future<int> startEngine({
+              required String binaryPath, String? axgPath, String? axnPath, String? safetensorsPath,
+              bool noTranspose = false, AxonMode mode = AxonMode.fp4, bool serveExternally = false, int requestedPort = 0,
+            }) async {
+              await stop();
+              final args = <String>[
+                if (axgPath != null && axgPath.isNotEmpty) ...['--axg', axgPath],
+                if (axnPath != null && axnPath.isNotEmpty) ...['--axn', axnPath],
+                if (safetensorsPath != null && safetensorsPath.isNotEmpty) ...['--safetensors', safetensorsPath, if (noTranspose) '--no-transpose'],
+                '--mode', mode.wire, '--serve', '--host', serveExternally ? '0.0.0.0' : '127.0.0.1', '--port', '$requestedPort',
+              ];
+              if (!Platform.isWindows) { await Process.run('chmod', ['+x', binaryPath]); }
+              _proc = await Process.start(binaryPath, args, workingDirectory: File(binaryPath).parent.path);
+              isServerMode = serveExternally;
+              final comp = Completer<int>(); final rx = RegExp(r'LISTENING_PORT\s*=\s*(\d+)');
+              void onLine(String l) {
+                final m = rx.firstMatch(l);
+                if (m != null && !comp.isCompleted) { final p = int.tryParse(m.group(1) ?? ''); if (p != null && p > 0) { port = p; comp.complete(p); } }
+              }
+              _proc!.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen(onLine);
+              _proc!.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen(onLine);
+              unawaited(_proc!.exitCode.then((c) { _proc = null; port = null; if (!comp.isCompleted) { comp.completeError(StateError('Exited $c')); } }));
+              return comp.future.timeout(const Duration(seconds: 8), onTimeout: () {
+                if (requestedPort > 0) { port = requestedPort; return requestedPort; }
+                throw TimeoutException('No LISTENING_PORT=');
+              });
+            }
+
+            Future<void> stop() async {
+              final p = _proc; _proc = null; port = null;
+              if (p != null) { p.kill(ProcessSignal.sigterm); await p.exitCode.timeout(const Duration(seconds: 2), onTimeout: () { p.kill(ProcessSignal.sigkill); return -1; }); }
+            }
+          }
+
+          class MobileNativeBridge implements AxonEngineClient {
+            static const _ch = MethodChannel('com.axon/engine');
+            Future<String> getStorageDir() async => (await _ch.invokeMethod<String>('getStorageDir')) ?? '';
+            Future<bool> extractAsset(String k, String p) async => (await _ch.invokeMethod<bool>('extractAsset', {'assetKey': k, 'targetPath': p})) ?? false;
+            Future<bool> patchAndSignApk({required String baseAssetKey, required String licenseJson, required List<String> modelPaths, String? soPath, String? iconPath, required String outPath}) async =>
+                (await _ch.invokeMethod<bool>('patchAndSignApk', {'baseAssetKey': baseAssetKey, 'licenseJson': licenseJson, 'modelPaths': modelPaths, 'soPath': soPath, 'iconPath': iconPath, 'outPath': outPath})) ?? false;
+            Future<bool> patchIpa({required String baseAssetKey, required String licenseJson, required List<String> modelPaths, List<String> extraIosPaths = const [], required String outPath}) async =>
+                (await _ch.invokeMethod<bool>('patchIpa', {'baseAssetKey': baseAssetKey, 'licenseJson': licenseJson, 'modelPaths': modelPaths, 'extraIosPaths': extraIosPaths, 'outPath': outPath})) ?? false;
+            Future<String> saveToDownloads({required String srcPath, required String subDir, required String fileName, String mimeType = 'application/octet-stream'}) async =>
+                (await _ch.invokeMethod<String>('saveToDownloads', {'srcPath': srcPath, 'subDir': subDir, 'fileName': fileName, 'mimeType': mimeType})) ?? srcPath;
+            Future<bool> installOrShareFile(String filePath, {String mimeType = 'application/octet-stream'}) async =>
+                (await _ch.invokeMethod<bool>('installOrShareFile', {'filePath': filePath, 'mimeType': mimeType})) ?? false;
+
+            Future<bool> initQuota(String lic, String led, bool locked) async => (await _ch.invokeMethod<bool>('initQuota', {'licensePath': lic, 'ledgerPath': led, 'endUserLocked': locked})) ?? false;
+            Future<bool> loadModel({required String axgPath, required String axnPath, required AxonMode mode}) async => (await _ch.invokeMethod<bool>('loadModel', {'axgPath': axgPath, 'axnPath': axnPath, 'mode': mode.wire})) ?? false;
+            @override Future<EngineStatus> fetchStatus() async => EngineStatus.fromJson(Map<String, dynamic>.from(jsonDecode((await _ch.invokeMethod<String>('getStatus')) ?? '{}') as Map));
+            @override Future<bool> setMode(AxonMode m) async => (await _ch.invokeMethod<bool>('setMode', {'mode': m.wire})) ?? false;
+            @override Future<bool> uploadModelFile(File f) => loadModel(axgPath: '', axnPath: f.path, mode: AxonMode.fp4);
+            @override Future<ChatResponse> sendChat(String p, {int maxTokens = 256, double temperature = 0.7}) async => ChatResponse.fromJson(Map<String, dynamic>.from(jsonDecode((await _ch.invokeMethod<String>('runChat', {'prompt': p, 'maxTokens': maxTokens, 'temperature': temperature})) ?? '{}') as Map));
+            @override Future<BenchResult> runBenchmark() async => BenchResult.fromJson(Map<String, dynamic>.from(jsonDecode((await _ch.invokeMethod<String>('runBench')) ?? '{}') as Map));
+            @override Future<void> resetKvCache() async => await _ch.invokeMethod('resetKvCache');
+          }
+
+          class ChatHistoryStore {
+            Future<File> _f() async { final d = AppPaths.appDataDir(); await d.create(recursive: true); return File('${d.path}${Platform.pathSeparator}chat_history.json'); }
+            Future<List<ChatSession>> loadSessions() async {
+              try { final f = await _f(); if (!await f.exists()) { return []; } return (jsonDecode(await f.readAsString()) as List).map((e) => ChatSession.fromJson(Map<String, dynamic>.from(e as Map))).toList(); } catch (_) { return []; }
+            }
+            Future<void> saveSessions(List<ChatSession> s) async => (await _f()).writeAsString(jsonEncode(s.map((x) => x.toJson()).toList()), flush: true);
+          }
+          """)
+
+          wf("android/app/src/main/kotlin/com/axon/axon_studio_app/MainActivity.kt", r"""
+          package com.axon.axon_studio_app
+
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.os.Build
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import androidx.core.content.FileProvider
+          import com.android.apksig.ApkSigner
+          import com.android.apksig.ApkVerifier
+          import com.axon.AxonBridge
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.ByteArrayOutputStream
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.security.KeyStore
+          import java.security.PrivateKey
+          import java.security.cert.X509Certificate
+          import java.util.concurrent.Executors
+          import java.util.zip.CRC32
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipFile
+          import java.util.zip.ZipOutputStream
+
+          class MainActivity : FlutterActivity() {
+              private val exec = Executors.newSingleThreadExecutor()
+              private val main = Handler(Looper.getMainLooper())
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.axon/engine").setMethodCallHandler { call, res ->
+                      exec.execute {
+                          try {
+                              val ans: Any? = when (call.method) {
+                                  "nativeVersion" -> if (AxonBridge.coreLoaded) AxonBridge.nativeVersion() else "Axon Mobile"
+                                  "getStorageDir" -> filesDir.absolutePath
+                                  "extractAsset" -> streamAsset(call.argument<String>("assetKey")!!, call.argument<String>("targetPath")!!)
+                                  "patchAndSignApk" -> patchAndSignApk(
+                                      call.argument<String>("baseAssetKey")!!,
+                                      call.argument<String>("licenseJson")!!,
+                                      call.argument<List<String>>("modelPaths") ?: emptyList(),
+                                      call.argument<String>("soPath"),
+                                      call.argument<String>("iconPath"),
+                                      call.argument<String>("outPath")!!
+                                  )
+                                  "patchIpa" -> patchIpa(
+                                      call.argument<String>("baseAssetKey")!!,
+                                      call.argument<String>("licenseJson")!!,
+                                      call.argument<List<String>>("modelPaths") ?: emptyList(),
+                                      call.argument<List<String>>("extraIosPaths") ?: emptyList(),
+                                      call.argument<String>("outPath")!!
+                                  )
+                                  "saveToDownloads" -> saveToDownloads(
+                                      call.argument<String>("srcPath")!!,
+                                      call.argument<String>("subDir") ?: "AxonStudio",
+                                      call.argument<String>("fileName")!!,
+                                      call.argument<String>("mimeType") ?: "application/octet-stream"
+                                  )
+                                  "installOrShareFile" -> installOrShareFile(
+                                      call.argument<String>("filePath")!!,
+                                      call.argument<String>("mimeType") ?: "application/octet-stream"
+                                  )
+                                  "initQuota" -> if (AxonBridge.bridgeLoaded) AxonBridge.initQuota(
+                                      call.argument("licensePath") ?: "", call.argument("ledgerPath") ?: "",
+                                      call.argument("endUserLocked") ?: false
+                                  ) else true
+                                  "loadModel" -> {
+                                      val axg = call.argument<String>("axgPath") ?: ""
+                                      val axn = call.argument<String>("axnPath") ?: ""
+                                      val md = call.argument<String>("mode") ?: "fp4"
+                                      if (AxonBridge.bridgeLoaded) AxonBridge.loadModel(axg, axn, md)
+                                      else if (AxonBridge.coreLoaded) AxonBridge.loadWeights(axn)
+                                      else false
+                                  }
+                                  "setMode" -> if (AxonBridge.bridgeLoaded) AxonBridge.setMode(call.argument("mode") ?: "fp4") else true
+                                  "resetKvCache" -> { if (AxonBridge.bridgeLoaded) AxonBridge.resetKvCache(); true }
+                                  "getStatus" -> if (AxonBridge.bridgeLoaded) AxonBridge.getStatus()
+                                      else "{\"edition\":\"mobile\",\"is_server\":false,\"quota_used_s\":0,\"quota_locked\":false,\"model\":\"none\",\"format\":\"-\",\"mode\":\"fp4\",\"raw_bytes\":0,\"active_bytes\":0,\"ram_saved\":0,\"flops_skipped\":0,\"last_ms\":0,\"opencl_device\":\"${if (AxonBridge.coreLoaded) "libaxon_android.so Loaded" else "ARM64 Ready"}\"}"
+                                  "runChat" -> if (AxonBridge.bridgeLoaded) AxonBridge.runChat(
+                                      call.argument("prompt") ?: "", call.argument("maxTokens") ?: 256,
+                                      (call.argument<Double>("temperature") ?: 0.7).toFloat()
+                                  ) else "{\"reply\":\"مدل .axg1/.axn3 و کتابخانه libaxon_android.so را بارگذاری کنید یا به سرور متصل شوید.\",\"ms\":0,\"tok_per_sec\":0,\"tokens\":0,\"kv_used\":0,\"kv_max\":4096,\"quota_locked\":false}"
+                                  "runBench" -> if (AxonBridge.bridgeLoaded) AxonBridge.runBench()
+                                      else "{\"cpu_ms\":1.0,\"gpu_ms\":1.0,\"cpu_gflops\":0,\"gpu_gflops\":0,\"speedup\":1.0,\"opencl_device\":\"ARM64\"}"
+                                  else -> null
+                              }
+                              main.post { if (ans == null) res.notImplemented() else res.success(ans) }
+                          } catch (t: Throwable) {
+                              main.post { res.error("AXON_ANDROID_ERR", t.message ?: t.toString(), null) }
+                          }
+                      }
+                  }
+              }
+
+              private fun streamAsset(assetKey: String, targetPath: String): Boolean {
+                  val out = File(targetPath)
+                  out.parentFile?.mkdirs()
+                  return runCatching {
+                      assets.open("flutter_assets/$assetKey").use { i ->
+                          FileOutputStream(out).use { o -> i.copyTo(o, 65536) }
+                      }
+                      true
+                  }.getOrDefault(false)
+              }
+
+              private fun resizePng(srcBmp: Bitmap, size: Int): ByteArray {
+                  val scaled = Bitmap.createScaledBitmap(srcBmp, size, size, true)
+                  val baos = ByteArrayOutputStream()
+                  scaled.compress(Bitmap.CompressFormat.PNG, 100, baos)
+                  if (scaled != srcBmp) scaled.recycle()
+                  return baos.toByteArray()
+              }
+
+              private fun writeStored(zos: ZipOutputStream, name: String, data: ByteArray) {
+                  val crc = CRC32().apply { update(data) }.value
+                  val e = ZipEntry(name).apply {
+                      method = ZipEntry.STORED
+                      size = data.size.toLong()
+                      compressedSize = data.size.toLong()
+                      this.crc = crc
+                  }
+                  zos.putNextEntry(e)
+                  zos.write(data)
+                  zos.closeEntry()
+              }
+
+              private fun patchAndSignApk(
+                  baseAssetKey: String, licenseJson: String, modelPaths: List<String>, soPath: String?, iconPath: String?, outPath: String
+              ): Boolean {
+                  val baseTmp = File(cacheDir, "tpl_base.apk")
+                  val patchedTmp = File(cacheDir, "patched_unsigned.apk")
+                  if (!streamAsset(baseAssetKey, baseTmp.absolutePath)) return false
+
+                  val overrides = LinkedHashMap<String, Pair<ByteArray?, File?>>()
+                  overrides["assets/flutter_assets/assets/config/axon_license.json"] = Pair(licenseJson.toByteArray(Charsets.UTF_8), null)
+                  for (mp in modelPaths) {
+                      val f = File(mp)
+                      if (f.exists()) overrides["assets/flutter_assets/assets/models/${f.name}"] = Pair(null, f)
+                  }
+                  if (!soPath.isNullOrEmpty() && File(soPath).exists()) {
+                      overrides["lib/arm64-v8a/libaxon_android.so"] = Pair(null, File(soPath))
+                  }
+
+                  val iconBmp = if (!iconPath.isNullOrEmpty() && File(iconPath).exists()) BitmapFactory.decodeFile(iconPath) else null
+                  if (iconBmp != null) {
+                      overrides["assets/flutter_assets/assets/config/brand_icon.png"] = Pair(resizePng(iconBmp, 192), null)
+                  }
+
+                  ZipFile(baseTmp).use { zf ->
+                      if (iconBmp != null) {
+                          val entriesScan = zf.entries()
+                          while (entriesScan.hasMoreElements()) {
+                              val name = entriesScan.nextElement().name
+                              if (name.contains("ic_launcher") && name.endsWith(".png")) {
+                                  val sz = when {
+                                      name.contains("xxxhdpi") -> 192
+                                      name.contains("xxhdpi") -> 144
+                                      name.contains("xhdpi") -> 96
+                                      name.contains("hdpi") -> 72
+                                      else -> 48
+                                  }
+                                  overrides[name] = Pair(resizePng(iconBmp, sz), null)
+                              }
+                          }
+                      }
+
+                      ZipOutputStream(FileOutputStream(patchedTmp)).use { zos ->
+                          val entries = zf.entries()
+                          while (entries.hasMoreElements()) {
+                              val e = entries.nextElement()
+                              val name = e.name
+                              if (e.isDirectory) continue
+                              if (name.startsWith("META-INF/") && (name.endsWith(".SF") || name.endsWith(".RSA") || name.endsWith(".DSA") || name.endsWith(".EC") || name == "META-INF/MANIFEST.MF")) continue
+                              if (overrides.containsKey(name)) continue
+
+                              val newEntry = ZipEntry(name)
+                              if (e.method == ZipEntry.STORED || name == "resources.arsc" || name.endsWith(".so") || name.endsWith(".png")) {
+                                  val crc = CRC32()
+                                  var total = 0L
+                                  val buf = ByteArray(65536)
+                                  zf.getInputStream(e).use { ins ->
+                                      while (true) { val n = ins.read(buf); if (n <= 0) break; crc.update(buf, 0, n); total += n }
+                                  }
+                                  newEntry.method = ZipEntry.STORED
+                                  newEntry.size = total; newEntry.compressedSize = total; newEntry.crc = crc.value
+                                  zos.putNextEntry(newEntry)
+                                  zf.getInputStream(e).use { ins -> ins.copyTo(zos, 65536) }
+                              } else {
+                                  newEntry.method = ZipEntry.DEFLATED
+                                  zos.putNextEntry(newEntry)
+                                  zf.getInputStream(e).use { ins -> ins.copyTo(zos, 65536) }
+                              }
+                              zos.closeEntry()
+                          }
+
+                          for ((name, src) in overrides) {
+                              val (bytes, file) = src
+                              if (name.endsWith(".so") || name.endsWith(".png")) {
+                                  if (bytes != null) writeStored(zos, name, bytes)
+                                  else {
+                                      val crc = CRC32(); val buf = ByteArray(65536); var total = 0L
+                                      FileInputStream(file!!).use { ins -> while (true) { val n = ins.read(buf); if (n <= 0) break; crc.update(buf, 0, n); total += n } }
+                                      val ne = ZipEntry(name).apply { method = ZipEntry.STORED; size = total; compressedSize = total; this.crc = crc.value }
+                                      zos.putNextEntry(ne)
+                                      FileInputStream(file).use { ins -> ins.copyTo(zos, 65536) }
+                                      zos.closeEntry()
+                                  }
+                              } else {
+                                  zos.putNextEntry(ZipEntry(name).apply { method = ZipEntry.DEFLATED })
+                                  if (bytes != null) zos.write(bytes)
+                                  else FileInputStream(file!!).use { ins -> ins.copyTo(zos, 65536) }
+                                  zos.closeEntry()
+                              }
+                          }
+                      }
+                  }
+                  iconBmp?.recycle()
+
+                  val ks = KeyStore.getInstance("PKCS12")
+                  assets.open("axon_signing.p12").use { ks.load(it, "axon1390".toCharArray()) }
+                  val privKey = ks.getKey("axon", "axon1390".toCharArray()) as PrivateKey
+                  val cert = ks.getCertificate("axon") as X509Certificate
+                  val signerConfig = ApkSigner.SignerConfig.Builder("AXON", privKey, listOf(cert)).build()
+
+                  val outFile = File(outPath)
+                  outFile.parentFile?.mkdirs()
+                  ApkSigner.Builder(listOf(signerConfig))
+                      .setInputApk(patchedTmp)
+                      .setOutputApk(outFile)
+                      .setV1SigningEnabled(true).setV2SigningEnabled(true).setV3SigningEnabled(true)
+                      .setMinSdkVersion(26).build().sign()
+
+                  val vr = ApkVerifier.Builder(outFile).build().verify()
+                  baseTmp.delete(); patchedTmp.delete()
+                  return vr.isVerified
+              }
+
+              private fun patchIpa(baseAssetKey: String, licenseJson: String, modelPaths: List<String>, extraIosPaths: List<String>, outPath: String): Boolean {
+                  val baseTmp = File(cacheDir, "tpl_base.ipa")
+                  if (!streamAsset(baseAssetKey, baseTmp.absolutePath)) return false
+                  val outFile = File(outPath); outFile.parentFile?.mkdirs()
+                  ZipFile(baseTmp).use { zf ->
+                      ZipOutputStream(FileOutputStream(outFile)).use { zos ->
+                          val entries = zf.entries()
+                          while (entries.hasMoreElements()) {
+                              val e = entries.nextElement()
+                              if (e.isDirectory || e.name.endsWith("axon_license.json")) continue
+                              zos.putNextEntry(ZipEntry(e.name))
+                              zf.getInputStream(e).use { it.copyTo(zos, 65536) }
+                              zos.closeEntry()
+                          }
+                          zos.putNextEntry(ZipEntry("Payload/Runner.app/axon_license.json"))
+                          zos.write(licenseJson.toByteArray(Charsets.UTF_8)); zos.closeEntry()
+                          for (mp in modelPaths) {
+                              val f = File(mp)
+                              if (f.exists()) { zos.putNextEntry(ZipEntry("Payload/Runner.app/models/${f.name}")); FileInputStream(f).use { it.copyTo(zos, 65536) }; zos.closeEntry() }
+                          }
+                          for (ep in extraIosPaths) {
+                              val f = File(ep)
+                              if (f.exists()) { zos.putNextEntry(ZipEntry("Payload/Runner.app/axon_sdk/${f.name}")); FileInputStream(f).use { it.copyTo(zos, 65536) }; zos.closeEntry() }
+                          }
+                      }
+                  }
+                  baseTmp.delete()
+                  return true
+              }
+
+              private fun saveToDownloads(srcPath: String, subDir: String, fileName: String, mimeType: String): String {
+                  val src = File(srcPath)
+                  if (!src.exists()) return srcPath
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                          put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                          put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$subDir")
+                          put(MediaStore.Downloads.IS_PENDING, 1)
+                      }
+                      val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return srcPath
+                      contentResolver.openOutputStream(uri)?.use { out -> FileInputStream(src).use { it.copyTo(out, 65536) } }
+                      values.clear(); values.put(MediaStore.Downloads.IS_PENDING, 0)
+                      contentResolver.update(uri, values, null, null)
+                      return "Download/$subDir/$fileName"
+                  } else {
+                      @Suppress("DEPRECATION")
+                      val dl = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subDir)
+                      dl.mkdirs(); val dst = File(dl, fileName); src.copyTo(dst, overwrite = true); return dst.absolutePath
+                  }
+              }
+
+              private fun installOrShareFile(filePath: String, mimeType: String): Boolean {
+                  val f = File(filePath); if (!f.exists()) return false
+                  val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", f)
+                  val intent = if (filePath.endsWith(".apk")) {
+                      Intent(Intent.ACTION_VIEW).apply {
+                          setDataAndType(uri, "application/vnd.android.package-archive")
+                          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                      }
+                  } else {
+                      Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                          type = mimeType; putExtra(Intent.EXTRA_STREAM, uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      }, "Share Axon Export")
+                  }
+                  startActivity(intent)
+                  return true
+              }
+
+              override fun onDestroy() { exec.shutdownNow(); super.onDestroy() }
+          }
+          """)
+
+          wf("lib/builder/multi_target_exporter.dart", r"""
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:archive/archive_io.dart';
+          import '../models/models.dart';
+          import '../security/security.dart';
+          import '../services/engine_services.dart';
+
+          class ExportedFileInfo {
+            final String label, internalPath, downloadsPath, mimeType;
+            const ExportedFileInfo({required this.label, required this.internalPath, required this.downloadsPath, required this.mimeType});
+          }
+
+          class BuildAssetsRequest {
+            final LicenseConfig unsignedLicense;
+            final Set<BuildTarget> targets;
+            final Map<BuildTarget, String> customExts;
+            final String customBaseName;
+            final Directory workDir;
+            final File? axgFile, axnFile, safetensorsFile, linuxBinary, windowsBinary, macBinary, androidSo, iosArm64A, iosSimA, iconPng;
+            final List<File> extraAndroidFiles, extraIosFiles;
+            const BuildAssetsRequest({
+              required this.unsignedLicense, required this.targets, required this.customExts, required this.customBaseName, required this.workDir,
+              this.axgFile, this.axnFile, this.safetensorsFile, this.linuxBinary, this.windowsBinary, this.macBinary,
+              this.androidSo, this.iosArm64A, this.iosSimA, this.iconPng,
+              this.extraAndroidFiles = const [], this.extraIosFiles = const [],
+            });
+          }
+
+          class MultiTargetExporter {
+            final MobileNativeBridge _bridge = MobileNativeBridge();
+
+            String _ext(BuildAssetsRequest r, BuildTarget t) {
+              final raw = (r.customExts[t] ?? '').trim().replaceAll(RegExp(r'^\.+'), '');
+              return raw.isEmpty ? t.defaultExt : raw;
+            }
+
+            Future<List<ExportedFileInfo>> exportAll(BuildAssetsRequest req, void Function(String) log) async {
+              await req.workDir.create(recursive: true);
+              final signed = HmacLicenseService.signConfig(req.unsignedLicense);
+              final licJson = const JsonEncoder.withIndent('  ').convert(signed.toJson());
+              final slug = (req.customBaseName.trim().isEmpty ? signed.brandName : req.customBaseName)
+                  .toLowerCase().replaceAll(RegExp(r'[^a-z0-9_-]+'), '-');
+              final subDir = 'AxonStudio/$slug';
+              final exported = <ExportedFileInfo>[];
+
+              log('✓ لایسنس HMAC-SHA256 امضا شد (Nonce: ${signed.nonce.substring(0, 8)}...)');
+              log('✓ سیستم‌عامل‌های مجاز: ${signed.uiCustom.allowedOs.join(', ')}');
+
+              for (final t in req.targets) {
+                log('\n▶ ساخت خروجی تک‌فایل برای ${t.title}...');
+                switch (t) {
+                  case BuildTarget.android:
+                    final a = await _apk(req, signed, licJson, slug, subDir, log);
+                    if (a != null) { exported.add(a); }
+                    break;
+                  case BuildTarget.windows:
+                    final w = await _win(req, signed, licJson, slug, subDir, log);
+                    if (w != null) { exported.add(w); }
+                    break;
+                  case BuildTarget.linux:
+                    final l = await _lin(req, signed, licJson, slug, subDir, log);
+                    if (l != null) { exported.add(l); }
+                    break;
+                  case BuildTarget.macos:
+                    final m = await _mac(req, signed, licJson, slug, subDir, log);
+                    if (m != null) { exported.add(m); }
+                    break;
+                  case BuildTarget.ios:
+                    final i = await _ios(req, signed, licJson, slug, subDir, log);
+                    if (i != null) { exported.add(i); }
+                    break;
+                case BuildTarget.axpkg:
+                    exported.add(await _axpkg(req, signed, licJson, slug, subDir, log));
+                    break;
+                }
+              }
+              log('\n✅ تمام خروجی‌ها در Download/$subDir ذخیره شدند.');
+              return exported;
+            }
+
+            Future<void> _stageData(Directory dir, BuildAssetsRequest req, String licJson) async {
+              await Directory('${dir.path}/models').create(recursive: true);
+              await Directory('${dir.path}/bin').create(recursive: true);
+              await File('${dir.path}/axon_license.json').writeAsString(licJson);
+              for (final f in [req.axgFile, req.axnFile, req.safetensorsFile]) {
+                if (f != null && await f.exists()) { await f.copy('${dir.path}/models/${f.uri.pathSegments.last}'); }
+              }
+              if (req.iconPng != null && await req.iconPng!.exists()) {
+                await req.iconPng!.copy('${dir.path}/brand_icon.png');
+              }
+            }
+
+            Future<void> _extractZip(File zip, Directory dst) async {
+              final arch = ZipDecoder().decodeBytes(await zip.readAsBytes());
+              for (final entry in arch) {
+                final out = '${dst.path}/${entry.name}';
+                if (entry.isFile) {
+                  final f = File(out); await f.parent.create(recursive: true);
+                  await f.writeAsBytes(entry.readBytes() ?? []);
+                } else { await Directory(out).create(recursive: true); }
+              }
+            }
+
+            Future<void> _extractTarGz(File tgz, Directory dst) async {
+              final tarBytes = GZipDecoder().decodeBytes(await tgz.readAsBytes());
+              final arch = TarDecoder().decodeBytes(tarBytes);
+              for (final entry in arch) {
+                final out = '${dst.path}/${entry.name}';
+                if (entry.isFile) {
+                  final f = File(out); await f.parent.create(recursive: true);
+                  await f.writeAsBytes(entry.readBytes() ?? []);
+                } else { await Directory(out).create(recursive: true); }
+              }
+            }
+
+            Future<ExportedFileInfo?> _apk(BuildAssetsRequest req, LicenseConfig cfg, String licJson, String slug, String subDir, void Function(String) log) async {
+              final ext = _ext(req, BuildTarget.android);
+              final fn = '$slug-android.$ext';
+              final outPath = '${req.workDir.path}/$fn';
+              final modelPaths = [req.axgFile?.path, req.axnFile?.path, req.safetensorsFile?.path].whereType<String>().toList();
+              final ok = await _bridge.patchAndSignApk(
+                baseAssetKey: 'assets/templates/android-enduser.apk',
+                licenseJson: licJson, modelPaths: modelPaths,
+                soPath: req.androidSo?.path, iconPath: req.iconPng?.path, outPath: outPath,
+              );
+              if (!ok) { log('⚠ ساخت/امضای APK ناموفق بود.'); return null; }
+              final dl = await _bridge.saveToDownloads(srcPath: outPath, subDir: subDir, fileName: fn, mimeType: 'application/vnd.android.package-archive');
+              log('✓ تک‌فایل نصبی اندروید با آیکون و موتور شما ساخته شد:\n  $dl');
+              return ExportedFileInfo(label: 'نصب / اشتراک $fn', internalPath: outPath, downloadsPath: dl, mimeType: 'application/vnd.android.package-archive');
+            }
+
+            Future<ExportedFileInfo?> _win(BuildAssetsRequest req, LicenseConfig cfg, String licJson, String slug, String subDir, void Function(String) log) async {
+              final ext = _ext(req, BuildTarget.windows);
+              final fn = '$slug-win64.$ext';
+              final tplZip = File('${req.workDir.path}/_tpl_win.zip');
+              final stage = Directory('${req.workDir.path}/_stage_win_$slug');
+              if (await stage.exists()) { await stage.delete(recursive: true); }
+              await stage.create(recursive: true);
+              if (await _bridge.extractAsset('assets/templates/windows-enduser.zip', tplZip.path)) {
+                await _extractZip(tplZip, stage); await tplZip.delete();
+              }
+              await _stageData(stage, req, licJson);
+              if (req.windowsBinary != null && await req.windowsBinary!.exists()) {
+                await req.windowsBinary!.copy('${stage.path}/bin/${req.windowsBinary!.uri.pathSegments.last}');
+              }
+              await File('${stage.path}/start_server.bat').writeAsString(
+                '@echo off\r\nbin\\axon-studio.exe ${cfg.bundledAxg.isNotEmpty ? "--axg models\\${cfg.bundledAxg} " : ""}'
+                '${cfg.bundledAxn.isNotEmpty ? "--axn models\\${cfg.bundledAxn} " : ""}--mode ${cfg.allowedModes.first} --serve --host 0.0.0.0 --port 8080\r\n',
+              );
+              final zipBytes = ZipEncoder().encode(createArchiveFromDirectory(stage, includeDirName: false));
+              final stubFile = File('${req.workDir.path}/_win_sfx.exe');
+              final out = File('${req.workDir.path}/$fn');
+              if (await _bridge.extractAsset('assets/templates/axon_win_sfx.exe', stubFile.path)) {
+                final sink = out.openWrite();
+                sink.add(await stubFile.readAsBytes()); sink.add(utf8.encode('__AXON_WIN_ZIP__')); sink.add(zipBytes);
+                await sink.close(); await stubFile.delete();
+              } else {
+                await out.writeAsBytes(zipBytes);
+              }
+              await stage.delete(recursive: true);
+              final dl = await _bridge.saveToDownloads(srcPath: out.path, subDir: subDir, fileName: fn, mimeType: 'application/octet-stream');
+              log('✓ تک‌فایل خوداجرای Windows با موتور axon-studio.exe ساخته شد:\n  $dl');
+              return ExportedFileInfo(label: 'اشتراک $fn', internalPath: out.path, downloadsPath: dl, mimeType: 'application/octet-stream');
+            }
+
+            Future<ExportedFileInfo?> _lin(BuildAssetsRequest req, LicenseConfig cfg, String licJson, String slug, String subDir, void Function(String) log) async {
+              final ext = _ext(req, BuildTarget.linux);
+              final fn = '$slug-linux-x64.$ext';
+              final tplTgz = File('${req.workDir.path}/_tpl_lin.tar.gz');
+              final stage = Directory('${req.workDir.path}/_stage_lin_$slug');
+              if (await stage.exists()) { await stage.delete(recursive: true); }
+              await stage.create(recursive: true);
+              if (await _bridge.extractAsset('assets/templates/linux-enduser.tar.gz', tplTgz.path)) {
+                await _extractTarGz(tplTgz, stage); await tplTgz.delete();
+              }
+              await _stageData(stage, req, licJson);
+              if (req.linuxBinary != null && await req.linuxBinary!.exists()) {
+                await req.linuxBinary!.copy('${stage.path}/bin/${req.linuxBinary!.uri.pathSegments.last}');
+              }
+              await File('${stage.path}/start-server.sh').writeAsString(
+                '#!/usr/bin/env bash\nDIR="\$(cd "\$(dirname "\$0")" && pwd)"\n'
+                'exec "\$DIR/bin/axon-studio" ${cfg.bundledAxg.isNotEmpty ? "--axg \"\$DIR/models/${cfg.bundledAxg}\" " : ""}'
+                '${cfg.bundledAxn.isNotEmpty ? "--axn \"\$DIR/models/${cfg.bundledAxn}\" " : ""}--mode ${cfg.allowedModes.first} --serve --host 0.0.0.0 --port \${PORT:-8080}\n',
+              );
+              final arch = createArchiveFromDirectory(stage, includeDirName: false);
+              for (final f in arch.files) {
+                if (f.name == 'axon_studio_app' || f.name == 'start-server.sh' || f.name.startsWith('bin/')) { f.mode = 493; }
+              }
+              final gzBytes = GZipEncoder().encode(TarEncoder().encode(arch));
+              final binOut = File('${req.workDir.path}/$fn');
+              final hdr = '#!/usr/bin/env bash\nset -e\nCACHE="\${XDG_CACHE_HOME:-\$HOME/.cache}/axon-$slug"\nrm -rf "\$CACHE" && mkdir -p "\$CACHE"\n'
+                  'L=\$(awk "/^__AXON_BIN__/ {print NR+1; exit 0;}" "\$0")\ntail -n +"\$L" "\$0" | tar -xz -C "\$CACHE"\nchmod +x "\$CACHE/axon_studio_app" "\$CACHE/start-server.sh" "\$CACHE/bin/"* 2>/dev/null || true\n'
+                  'if [ "\${1:-}" = "--serve" ]; then shift; exec "\$CACHE/start-server.sh" "\$@"; fi\nexec "\$CACHE/axon_studio_app" "\$@"\nexit 0\n__AXON_BIN__\n';
+              final sink = binOut.openWrite(); sink.add(utf8.encode(hdr)); sink.add(gzBytes); await sink.close();
+              await stage.delete(recursive: true);
+              final dl = await _bridge.saveToDownloads(srcPath: binOut.path, subDir: subDir, fileName: fn, mimeType: 'application/octet-stream');
+              log('✓ تک‌فایل خوداجرای Linux با موتور axon-studio ساخته شد:\n  $dl');
+              return ExportedFileInfo(label: 'اشتراک $fn', internalPath: binOut.path, downloadsPath: dl, mimeType: 'application/octet-stream');
+            }
+
+            Future<ExportedFileInfo?> _mac(BuildAssetsRequest req, LicenseConfig cfg, String licJson, String slug, String subDir, void Function(String) log) async {
+              final ext = _ext(req, BuildTarget.macos);
+              final fn = '$slug-macos.$ext';
+              final tplTgz = File('${req.workDir.path}/_tpl_mac.tar.gz');
+              final stage = Directory('${req.workDir.path}/_stage_mac_$slug');
+              if (await stage.exists()) { await stage.delete(recursive: true); }
+              await stage.create(recursive: true);
+              if (!await _bridge.extractAsset('assets/templates/macos-enduser.tar.gz', tplTgz.path)) {
+                log('⚠ تمپلیت macOS یافت نشد.'); return null;
+              }
+              await _extractTarGz(tplTgz, stage); await tplTgz.delete();
+              final appDir = stage.listSync().whereType<Directory>().where((d) => d.path.endsWith('.app')).firstOrNull ?? Directory('${stage.path}/AxonStudio.app');
+              final plist = File('${appDir.path}/Contents/Info.plist');
+              if (await plist.exists()) {
+                var xml = await plist.readAsString();
+                xml = xml.replaceAll(RegExp(r'<key>CFBundleName</key>\s*<string>[^<]*</string>'), '<key>CFBundleName</key><string>${cfg.brandName}</string>');
+                await plist.writeAsString(xml);
+              }
+              final resDir = Directory('${appDir.path}/Contents/Resources');
+              await _stageData(resDir, req, licJson);
+              if (req.macBinary != null && await req.macBinary!.exists()) {
+                await req.macBinary!.copy('${resDir.path}/bin/${req.macBinary!.uri.pathSegments.last}');
+              }
+              final arch = createArchiveFromDirectory(stage, includeDirName: false);
+              for (final f in arch.files) {
+                if (f.name.contains('/Contents/MacOS/') || f.name.contains('/Contents/Resources/bin/')) { f.mode = 493; }
+              }
+              final out = File('${req.workDir.path}/$fn');
+              await out.writeAsBytes(GZipEncoder().encode(TarEncoder().encode(arch)));
+              await stage.delete(recursive: true);
+              final dl = await _bridge.saveToDownloads(srcPath: out.path, subDir: subDir, fileName: fn, mimeType: 'application/gzip');
+              log('✓ بسته macOS (.app) ساخته شد:\n  $dl');
+              return ExportedFileInfo(label: 'اشتراک $fn', internalPath: out.path, downloadsPath: dl, mimeType: 'application/gzip');
+            }
+
+            Future<ExportedFileInfo?> _ios(BuildAssetsRequest req, LicenseConfig cfg, String licJson, String slug, String subDir, void Function(String) log) async {
+              final ext = _ext(req, BuildTarget.ios);
+              final fn = '$slug-ios.$ext';
+              final outPath = '${req.workDir.path}/$fn';
+              final modelPaths = [req.axgFile?.path, req.axnFile?.path, req.safetensorsFile?.path].whereType<String>().toList();
+              final extraIos = [req.iosArm64A?.path, req.iosSimA?.path, ...req.extraIosFiles.map((e) => e.path)].whereType<String>().toList();
+              final ok = await _bridge.patchIpa(
+                baseAssetKey: 'assets/templates/ios-enduser-unsigned.ipa',
+                licenseJson: licJson, modelPaths: modelPaths, extraIosPaths: extraIos, outPath: outPath,
+              );
+              if (!ok) { log('⚠ تمپلیت iOS یافت نشد.'); return null; }
+              final dl = await _bridge.saveToDownloads(srcPath: outPath, subDir: subDir, fileName: fn, mimeType: 'application/octet-stream');
+              log('✓ بسته iOS با SDK آیفون ساخته شد:\n  $dl');
+              return ExportedFileInfo(label: 'اشتراک $fn', internalPath: outPath, downloadsPath: dl, mimeType: 'application/octet-stream');
+            }
+
+            Future<ExportedFileInfo> _axpkg(BuildAssetsRequest req, LicenseConfig cfg, String licJson, String slug, String subDir, void Function(String) log) async {
+              final ext = _ext(req, BuildTarget.axpkg);
+              final fn = '$slug-axon-bundle.$ext';
+              final stage = Directory('${req.workDir.path}/_stage_axpkg_$slug');
+              if (await stage.exists()) { await stage.delete(recursive: true); }
+              await stage.create(recursive: true);
+              await File('${stage.path}/axon_license.json').writeAsString(licJson);
+              for (final f in [req.axgFile, req.axnFile, req.safetensorsFile]) {
+                if (f != null && await f.exists()) { await f.copy('${stage.path}/${f.uri.pathSegments.last}'); }
+              }
+              if (req.windowsBinary != null && await req.windowsBinary!.exists()) { await req.windowsBinary!.copy('${stage.path}/win_${req.windowsBinary!.uri.pathSegments.last}'); }
+              if (req.linuxBinary != null && await req.linuxBinary!.exists()) { await req.linuxBinary!.copy('${stage.path}/linux_${req.linuxBinary!.uri.pathSegments.last}'); }
+              if (req.macBinary != null && await req.macBinary!.exists()) { await req.macBinary!.copy('${stage.path}/macos_${req.macBinary!.uri.pathSegments.last}'); }
+              if (req.androidSo != null && await req.androidSo!.exists()) { await req.androidSo!.copy('${stage.path}/android_${req.androidSo!.uri.pathSegments.last}'); }
+              if (req.iosArm64A != null && await req.iosArm64A!.exists()) { await req.iosArm64A!.copy('${stage.path}/${req.iosArm64A!.uri.pathSegments.last}'); }
+              if (req.iconPng != null && await req.iconPng!.exists()) { await req.iconPng!.copy('${stage.path}/brand_icon.png'); }
+
+              final out = File('${req.workDir.path}/$fn');
+              final bytes = ZipEncoder(level: 9).encode(createArchiveFromDirectory(stage, includeDirName: false));
+              await out.writeAsBytes(bytes);
+              await stage.delete(recursive: true);
+              final dl = await _bridge.saveToDownloads(srcPath: out.path, subDir: subDir, fileName: fn, mimeType: 'application/octet-stream');
+              log('✓ تک‌فایل کم‌حجم‌شده مدل+موتور Axon (${(bytes.length / 1024).toStringAsFixed(1)} KB) ساخته شد:\n  $dl');
+              return ExportedFileInfo(label: 'اشتراک تک‌فایل $fn', internalPath: out.path, downloadsPath: dl, mimeType: 'application/octet-stream');
+            }
+          }
+          """)
+
+          wf("lib/state/studio_controller.dart", r"""
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:flutter/foundation.dart';
+          import '../app_config.dart';
+          import '../models/models.dart';
+          import '../security/security.dart';
+          import '../services/engine_services.dart';
+          import '../services/vault_service.dart';
+
+          class StudioController extends ChangeNotifier {
+            final DesktopProcessManager processManager = DesktopProcessManager();
+            final MobileNativeBridge mobileBridge = MobileNativeBridge();
+            final ChatHistoryStore _history = ChatHistoryStore();
+            final VaultService vault = VaultService();
+
+            AxonEngineClient? _client;
+            Timer? _statusTimer, _quotaTimer;
+            bool isRtl = true, isRemoteMode = false, isGenerating = false, isBenchmarking = false, adminUnlocked = false, isInitialized = false, osDisallowed = false;
+            String remoteUrl = 'http://192.168.1.100:8080';
+            String? lastError;
+            EngineStatus status = EngineStatus.empty();
+            BenchResult? benchResult;
+            LicenseConfig? licenseConfig;
+            LicenseEvalResult? licenseEval;
+            List<ChatSession> sessions = [];
+            String? activeSessionId;
+            File? customBrandIconFile;
+
+            bool get isDesktop => Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+            bool get isQuotaLocked => osDisallowed || status.quotaLocked || (licenseEval?.quotaLocked ?? false);
+            UiCustomConfig get uiCustom => licenseConfig?.uiCustom ?? const UiCustomConfig();
+
+            ChatSession get currentSession {
+              if (sessions.isEmpty) {
+                final s = ChatSession(id: '${DateTime.now().millisecondsSinceEpoch}', title: 'گفتگوی جدید Axon', updatedAt: DateTime.now(), messages: []);
+                sessions = [s]; activeSessionId = s.id;
+              }
+              return sessions.firstWhere((s) => s.id == activeSessionId, orElse: () => sessions.first);
+            }
+
+            Future<void> initialize() async {
+              if (isInitialized) { return; }
+              isInitialized = true;
+              try {
+                if (!isDesktop) {
+                  final dir = await mobileBridge.getStorageDir();
+                  AppPaths.setMobileDataDir(dir);
+                }
+                await vault.load();
+                sessions = await _history.loadSessions();
+                if (sessions.isNotEmpty) { activeSessionId = sessions.first.id; }
+                await _loadLicense();
+                isRtl = uiCustom.defaultRtl;
+                final osId = AppPaths.currentOsId();
+                if (AppConfig.isEndUserBuild && !uiCustom.allowedOs.contains(osId)) {
+                  osDisallowed = true;
+                  lastError = 'این نسخه برای سیستم‌عامل $osId مجاز نیست.';
+                }
+                await _loadBrandIcon();
+                await _bootLocal();
+                _statusTimer = Timer.periodic(const Duration(seconds: 4), (_) => refreshStatus());
+                _quotaTimer = Timer.periodic(const Duration(seconds: 5), (_) => _tickQuota());
+              } catch (e) {
+                lastError = 'خطای راه‌اندازی: $e';
+              }
+              notifyListeners();
+            }
+
+            Future<void> _loadBrandIcon() async {
+              if (!uiCustom.hasCustomIcon) { return; }
+              final p = '${AppPaths.appDataDir().path}${Platform.pathSeparator}brand_icon.png';
+              if (!isDesktop) { await mobileBridge.extractAsset('assets/config/brand_icon.png', p); }
+              final f = File(p);
+              if (await f.exists()) { customBrandIconFile = f; }
+            }
+
+            Future<void> _loadLicense() async {
+              try {
+                final raw = await AppPaths.loadBundledLicenseJson();
+                if (raw != null && raw.trim().isNotEmpty) {
+                  licenseConfig = LicenseConfig.fromJson(Map<String, dynamic>.from(jsonDecode(raw) as Map));
+                }
+                final ledger = File('${AppPaths.appDataDir().path}${Platform.pathSeparator}quota_ledger.dat');
+                licenseEval = await HmacLicenseService.evaluateAndTick(cfg: licenseConfig, ledgerFile: ledger, isServerActive: processManager.isServerMode);
+              } catch (e) {
+                licenseEval = LicenseEvalResult(valid: false, quotaLocked: AppConfig.isEndUserBuild, reason: 'خطای لایسنس: $e');
+              }
+            }
+
+            Future<void> _tickQuota() async {
+              if (licenseConfig == null && !AppConfig.isEndUserBuild) { return; }
+              final ledger = File('${AppPaths.appDataDir().path}${Platform.pathSeparator}quota_ledger.dat');
+              licenseEval = await HmacLicenseService.evaluateAndTick(
+                cfg: licenseConfig, ledgerFile: ledger, isServerActive: processManager.isServerMode || status.isServer, deltaSeconds: 5,
+              );
+              if (licenseEval?.quotaLocked == true && processManager.isRunning) { await processManager.stop(); }
+              notifyListeners();
+            }
+
+            Future<void> _bootLocal() async {
+              if (osDisallowed) { return; }
+              try {
+                if (isDesktop) {
+                  final bin = await AppPaths.findAxonBinary(preferPro: licenseConfig?.edition == 'pro');
+                  if (bin != null) {
+                    final axg = await AppPaths.findModelFile(licenseConfig?.bundledAxg ?? '');
+                    final axn = await AppPaths.findModelFile(licenseConfig?.bundledAxn ?? '');
+                    final st = await AppPaths.findModelFile(licenseConfig?.bundledSafetensors ?? '');
+                    final allowed = licenseConfig?.allowedModes ?? ['fp4'];
+                    final port = await processManager.startEngine(
+                      binaryPath: bin, axgPath: axg?.path, axnPath: axn?.path, safetensorsPath: st?.path,
+                      noTranspose: licenseConfig?.noTranspose ?? false, mode: AxonMode.fromWire(allowed.first),
+                    );
+                    _client = HttpAxonEngineClient('http://127.0.0.1:$port');
+                    await refreshStatus();
+                  }
+                } else {
+                  final dir = AppPaths.appDataDir().path;
+                  final licP = '$dir/axon_license.json', ledP = '$dir/quota_ledger.dat';
+                  if (licenseConfig != null) { await File(licP).writeAsString(jsonEncode(licenseConfig!.toJson())); }
+                  await mobileBridge.initQuota(licP, ledP, AppConfig.isEndUserBuild);
+                  if (licenseConfig != null && licenseConfig!.bundledAxn.isNotEmpty) {
+                    final axnO = '$dir/${licenseConfig!.bundledAxn}';
+                    await mobileBridge.extractAsset('assets/models/${licenseConfig!.bundledAxn}', axnO);
+                    var axgO = '';
+                    if (licenseConfig!.bundledAxg.isNotEmpty) {
+                      axgO = '$dir/${licenseConfig!.bundledAxg}';
+                      await mobileBridge.extractAsset('assets/models/${licenseConfig!.bundledAxg}', axgO);
+                    }
+                    await mobileBridge.loadModel(axgPath: axgO, axnPath: axnO, mode: AxonMode.fp4);
+                  }
+                  _client = mobileBridge;
+                  await refreshStatus();
+                }
+              } catch (e) { lastError = '$e'; }
+              notifyListeners();
+            }
+
+            bool isModeAllowed(AxonMode m) => licenseConfig?.allowedModes.contains(m.wire) ?? true;
+            Future<void> refreshStatus() async { try { if (_client != null) { status = await _client!.fetchStatus(); notifyListeners(); } } catch (_) {} }
+            Future<void> changeMode(AxonMode m) async { if (isModeAllowed(m) && !isQuotaLocked && _client != null && await _client!.setMode(m)) { await refreshStatus(); } }
+
+            Future<void> uploadModelPair(List<File> files) async {
+              if (licenseConfig?.lockModels == true || _client == null) { return; }
+              for (final f in files) {
+                if (f.path.toLowerCase().endsWith('.axpkg')) {
+                  final axn = await AppPaths.unpackSingleBundle(f);
+                  await _loadLicense();
+                  if (axn != null) {
+                    final axg = await AppPaths.findModelFile(licenseConfig?.bundledAxg ?? '');
+                    if (!isDesktop) { await mobileBridge.loadModel(axgPath: axg?.path ?? '', axnPath: axn.path, mode: status.mode); }
+                    else { await _client!.uploadModelFile(axn); }
+                  }
+                } else {
+                  await _client!.uploadModelFile(f);
+                }
+              }
+              await refreshStatus();
+            }
+
+            Future<void> sendMessage(String prompt) async {
+              final t = prompt.trim();
+              if (t.isEmpty || isGenerating || isQuotaLocked || _client == null) { return; }
+              final s = currentSession;
+              s.messages.add(ChatMessage(id: '${DateTime.now().microsecondsSinceEpoch}', isUser: true, text: t, timestamp: DateTime.now()));
+              isGenerating = true; lastError = null; notifyListeners();
+              try {
+                final r = await _client!.sendChat(t);
+                s.messages.add(ChatMessage(id: '${DateTime.now().microsecondsSinceEpoch}', isUser: false, text: r.reply, latencyMs: r.ms, tokPerSec: r.tokPerSec, tokens: r.tokens, kvUsed: r.kvUsed, kvMax: r.kvMax, timestamp: DateTime.now()));
+                await _history.saveSessions(sessions); await refreshStatus();
+              } catch (e) { lastError = '$e'; } finally { isGenerating = false; notifyListeners(); }
+            }
+
+            Future<void> runBench() async {
+              if (_client == null || isBenchmarking || !uiCustom.allowBench) { return; }
+              isBenchmarking = true; notifyListeners();
+              try { benchResult = await _client!.runBenchmark(); } catch (e) { lastError = '$e'; } finally { isBenchmarking = false; notifyListeners(); }
+            }
+
+            Future<void> connectRemote(String url) async {
+              if (!uiCustom.allowServer) { return; }
+              remoteUrl = url.trim(); isRemoteMode = true; _client = HttpAxonEngineClient(remoteUrl);
+              try { status = await _client!.fetchStatus(); lastError = null; } catch (e) { lastError = '$e'; }
+              notifyListeners();
+            }
+
+            Future<void> switchToLocalMode() async { isRemoteMode = false; await _bootLocal(); }
+
+            Future<void> toggleServerHost({required bool enableServer, int port = 8080}) async {
+              if (!isDesktop || !uiCustom.allowServer) { return; }
+              final bin = await AppPaths.findAxonBinary(preferPro: licenseConfig?.edition == 'pro');
+              if (bin == null) { return; }
+              final bound = await processManager.startEngine(binaryPath: bin, mode: status.mode, serveExternally: enableServer, requestedPort: enableServer ? port : 0);
+              _client = HttpAxonEngineClient('http://127.0.0.1:$bound');
+              await refreshStatus(); notifyListeners();
+            }
+
+            void createNewSession() { final s = ChatSession(id: '${DateTime.now().millisecondsSinceEpoch}', title: 'گفتگوی جدید', updatedAt: DateTime.now(), messages: []); sessions.insert(0, s); activeSessionId = s.id; _history.saveSessions(sessions); notifyListeners(); }
+            void selectSession(String id) { activeSessionId = id; _client?.resetKvCache(); notifyListeners(); }
+            void toggleLanguage() { isRtl = !isRtl; notifyListeners(); }
+            @override void dispose() { _statusTimer?.cancel(); _quotaTimer?.cancel(); processManager.stop(); super.dispose(); }
+          }
+          """)
+
+          wf("lib/ui/screens.dart", r"""
+          import 'dart:io';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/services.dart';
+          import 'package:material_ui/material_ui.dart';
+          import '../app_config.dart';
+          import '../builder/multi_target_exporter.dart';
+          import '../models/models.dart';
+          import '../security/security.dart';
+          import '../services/engine_services.dart';
+          import '../state/studio_controller.dart';
+          import 'widgets.dart';
+
+          const List<IconData> kAxonSymbols = [
+            Icons.hub_rounded,
+            Icons.bolt_rounded,
+            Icons.auto_awesome_rounded,
+            Icons.psychology_rounded,
+            Icons.memory_rounded,
+            Icons.rocket_launch_rounded,
+            Icons.shield_rounded,
+            Icons.terminal_rounded,
+          ];
+
+          class ChatWorkspaceScreen extends StatefulWidget {
+            final StudioController controller;
+            const ChatWorkspaceScreen({super.key, required this.controller});
+            @override State<ChatWorkspaceScreen> createState() => _ChatState();
+          }
+
+          class _ChatState extends State<ChatWorkspaceScreen> {
+            final _ctrl = TextEditingController();
+            @override void dispose() { _ctrl.dispose(); super.dispose(); }
+            void _send() { final t = _ctrl.text; if (t.trim().isEmpty) { return; } _ctrl.clear(); widget.controller.sendMessage(t); }
+
+            @override
+            Widget build(BuildContext context) {
+              final c = widget.controller; final s = c.currentSession;
+              final accent = Color(c.uiCustom.accentArgb);
+              final sym = kAxonSymbols[c.uiCustom.symbolId.clamp(0, kAxonSymbols.length - 1)];
+              return Column(children: [
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: GlassCard(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    child: Row(children: [
+                      Icon(sym, color: accent, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text('${c.status.model}  •  ${c.status.mode.title}', overflow: TextOverflow.ellipsis)),
+                      IconButton(onPressed: c.createNewSession, icon: const Icon(Icons.add_comment_rounded, size: 18)),
+                    ]),
+                  ),
+                ),
+                if (c.isQuotaLocked)
+                  Container(margin: const EdgeInsets.symmetric(horizontal: 12), padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: Colors.redAccent.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(10)), child: Text(c.osDisallowed ? (c.lastError ?? 'سیستم‌عامل غیرمجاز') : (c.licenseEval?.reason ?? 'سهمیه قفل شده است'))),
+                if (c.lastError != null && !c.osDisallowed)
+                  Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Text(c.lastError!, style: const TextStyle(color: Colors.amberAccent, fontSize: 12))),
+                Expanded(
+                  child: s.messages.isEmpty
+                      ? Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                          if (c.customBrandIconFile != null)
+                            ClipRRect(borderRadius: BorderRadius.circular(18), child: Image.file(c.customBrandIconFile!, width: 64, height: 64, fit: BoxFit.cover))
+                          else
+                            Icon(sym, size: 48, color: accent),
+                          const SizedBox(height: 10),
+                          Text(c.uiCustom.welcomeText, textAlign: TextAlign.center, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                        ]))
+                      : ListView.builder(
+                          padding: const EdgeInsets.all(14), itemCount: s.messages.length,
+                          itemBuilder: (_, i) {
+                            final m = s.messages[i];
+                            return Align(
+                              alignment: m.isUser ? Alignment.centerRight : Alignment.centerLeft,
+                              child: Container(
+                                constraints: const BoxConstraints(maxWidth: 660), margin: const EdgeInsets.symmetric(vertical: 5), padding: const EdgeInsets.all(13),
+                                decoration: BoxDecoration(color: m.isUser ? const Color(0xFF1E2942) : const Color(0xFF121722), borderRadius: BorderRadius.circular(15), border: Border.all(color: Colors.white.withValues(alpha: 0.08))),
+                                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                  SelectableText(m.text),
+                                  if (!m.isUser && m.latencyMs != null) Padding(padding: const EdgeInsets.only(top: 6), child: Text('${m.latencyMs!.toStringAsFixed(1)} ms • ${(m.tokPerSec ?? 0).toStringAsFixed(1)} tok/s', textDirection: TextDirection.ltr, style: TextStyle(fontSize: 11, color: accent))),
+                                ]),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: GlassCard(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                    child: Row(children: [
+                      Expanded(child: TextField(controller: _ctrl, enabled: !c.isQuotaLocked && !c.isGenerating, onSubmitted: (_) => _send(), decoration: InputDecoration(border: InputBorder.none, hintText: c.isRtl ? 'پیام خود را بنویسید...' : 'Prompt Axon...'))),
+                      IconButton.filled(onPressed: c.isQuotaLocked || c.isGenerating ? null : _send, icon: const Icon(Icons.send_rounded)),
+                    ]),
+                  ),
+                ),
+              ]);
+            }
+          }
+
+          class EngineSettingsScreen extends StatelessWidget {
+            final StudioController controller;
+            const EngineSettingsScreen({super.key, required this.controller});
+            @override
+            Widget build(BuildContext context) {
+              final c = controller; final st = c.status; final lock = c.licenseConfig?.lockModels == true;
+              final accent = Color(c.uiCustom.accentArgb);
+              return ListView(padding: const EdgeInsets.all(16), children: [
+                Wrap(spacing: 12, runSpacing: 12, children: [
+                  _kpi('ذخیره رم', '${st.ramSaved.toStringAsFixed(1)}%', accent),
+                  _kpi('FLOPs ردشده', '${st.flopsSkipped.toStringAsFixed(1)}%', const Color(0xFF7C4DFF)),
+                  _kpi('تاخیر اجرا', '${st.lastMs.toStringAsFixed(1)} ms', const Color(0xFF1DE9B6)),
+                  _kpi('سخت‌افزار', st.openclDevice, const Color(0xFFFFB74D)),
+                ]),
+                const SizedBox(height: 16),
+                GlassCard(child: Wrap(spacing: 10, runSpacing: 10, children: AxonMode.values.map((m) {
+                  final sel = st.mode == m; final ok = c.isModeAllowed(m);
+                  return SizedBox(width: 215, child: GlassCard(
+                    padding: const EdgeInsets.all(12), borderColor: sel ? accent : null, onTap: ok ? () => c.changeMode(m) : null,
+                    child: Row(children: [
+                      Icon(ok ? (sel ? Icons.check_circle : Icons.circle_outlined) : Icons.lock, color: sel ? accent : Colors.white54, size: 18),
+                      const SizedBox(width: 8), Expanded(child: Text(m.title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600))),
+                    ]),
+                  ));
+                }).toList())),
+                const SizedBox(height: 16),
+                GlassCard(child: Row(children: [
+                  Expanded(child: Text(lock ? 'بارگذاری مدل قفل شده است' : 'آپلود مدل (.axg1 / .axn3 / .safetensors / .axpkg)')),
+                  FilledButton.icon(
+                    onPressed: lock ? null : () async {
+                      final fs = await FilePicker.pickFiles(type: FileType.any);
+                      if (fs.isNotEmpty) { await c.uploadModelPair(fs.where((p) => p.path != null).map((p) => File(p.path!)).toList()); }
+                    },
+                    icon: const Icon(Icons.upload_file), label: const Text('انتخاب مدل'),
+                  ),
+                ])),
+                if (c.uiCustom.allowBench) ...[
+                  const SizedBox(height: 16),
+                  GlassCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [const Text('بنچمارک سخت‌افزار', style: TextStyle(fontWeight: FontWeight.bold)), const Spacer(), FilledButton(onPressed: c.isBenchmarking ? null : c.runBench, child: const Text('اجرا'))]),
+                    const SizedBox(height: 12),
+                    if (c.benchResult != null) BenchBarChart(cpuMs: c.benchResult!.cpuMs, gpuMs: c.benchResult!.gpuMs, cpuGflops: c.benchResult!.cpuGflops, gpuGflops: c.benchResult!.gpuGflops),
+                  ])),
+                ],
+              ]);
+            }
+            Widget _kpi(String t, String v, Color c) => SizedBox(width: 220, child: GlassCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(t, style: const TextStyle(fontSize: 12, color: Colors.white60)), const SizedBox(height: 6), Text(v, textDirection: TextDirection.ltr, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: c))])));
+          }
+
+          class ServerConnectScreen extends StatefulWidget {
+            final StudioController controller;
+            const ServerConnectScreen({super.key, required this.controller});
+            @override State<ServerConnectScreen> createState() => _SrvState();
+          }
+
+          class _SrvState extends State<ServerConnectScreen> {
+            late final _url = TextEditingController(text: widget.controller.remoteUrl);
+            final _port = TextEditingController(text: '8080');
+            String _ip = '127.0.0.1';
+            @override void initState() { super.initState(); _findIp(); }
+            Future<void> _findIp() async {
+              try {
+                for (final i in await NetworkInterface.list(type: InternetAddressType.IPv4)) {
+                  for (final a in i.addresses) {
+                    if (!a.isLoopback && mounted) { setState(() => _ip = a.address); return; }
+                  }
+                }
+              } catch (_) {}
+            }
+            @override void dispose() { _url.dispose(); _port.dispose(); super.dispose(); }
+            @override Widget build(BuildContext context) {
+              final c = widget.controller;
+              if (!c.uiCustom.allowServer) {
+                return const Center(child: Text('اتصال به سرور خارجی در این نسخه غیرفعال شده است.'));
+              }
+              final hostUrl = 'http://$_ip:${c.processManager.port ?? 8080}';
+              return ListView(padding: const EdgeInsets.all(16), children: [
+                GlassCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  SegmentedButton<bool>(segments: const [ButtonSegment(value: false, label: Text('آفلاین لوکال')), ButtonSegment(value: true, label: Text('سرور خارجی'))], selected: {c.isRemoteMode}, onSelectionChanged: (s) { if (!s.first) { c.switchToLocalMode(); } }),
+                  const SizedBox(height: 12),
+                  Row(children: [
+                    Expanded(child: TextField(controller: _url, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'Server URL', border: OutlineInputBorder()))),
+                    const SizedBox(width: 8), FilledButton(onPressed: () => c.connectRemote(_url.text), child: const Text('اتصال')),
+                  ]),
+                ])),
+                if (c.isDesktop) ...[
+                  const SizedBox(height: 14),
+                  GlassCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [const Expanded(child: Text('حالت میزبانی سرور (--serve --host 0.0.0.0)')), Switch(value: c.processManager.isServerMode, onChanged: (v) => c.toggleServerHost(enableServer: v, port: int.tryParse(_port.text) ?? 8080))]),
+                    SizedBox(width: 140, child: TextField(controller: _port, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'Port', border: OutlineInputBorder()))),
+                    if (c.processManager.isServerMode) ...[const SizedBox(height: 12), Row(children: [OfflineQrCode(data: hostUrl), const SizedBox(width: 16), Expanded(child: SelectableText(hostUrl, textDirection: TextDirection.ltr)), IconButton(icon: const Icon(Icons.copy), onPressed: () => Clipboard.setData(ClipboardData(text: hostUrl)))])],
+                  ])),
+                ],
+              ]);
+            }
+          }
+
+          class AdminBuilderScreen extends StatefulWidget {
+            final StudioController controller;
+            const AdminBuilderScreen({super.key, required this.controller});
+            @override State<AdminBuilderScreen> createState() => _AdmState();
+          }
+
+          class _AdmState extends State<AdminBuilderScreen> {
+            final _brand = TextEditingController(text: 'Axon Studio Pro');
+            final _fileName = TextEditingController(text: 'axon-pro');
+            final _welcome = TextEditingController(text: 'موتور Axon v12.0 آماده گفتگوی آفلاین است');
+            final _wkH = TextEditingController(text: '40');
+            final _wkM = TextEditingController(text: '0');
+            final _totH = TextEditingController(text: '0');
+            final _totM = TextEditingController(text: '0');
+            final _expD = TextEditingController(text: '0');
+            final Map<BuildTarget, TextEditingController> _extCtrls = {
+              for (final t in BuildTarget.values) t: TextEditingController(text: t.defaultExt),
+            };
+
+            String _edition = 'pro';
+            QuotaScope _scope = QuotaScope.serverOnly;
+            bool _lockModels = false, _allowBench = true, _allowServer = true, _defaultRtl = true, _busy = false;
+            int _accentArgb = 0xFF00E5FF, _bgArgb = 0xFF090B10, _symbolId = 0;
+            File? _customIconPng;
+
+            final Set<String> _modes = {'fp4', 'brain', 'ternary', 'f32', 'gpu'};
+            final Set<String> _allowedOs = {'android', 'windows', 'linux', 'macos', 'ios'};
+            final Set<BuildTarget> _targets = {BuildTarget.android, BuildTarget.axpkg};
+            final List<String> _logs = [];
+            List<ExportedFileInfo> _exported = [];
+
+            static const _accents = [0xFF00E5FF, 0xFF1DE9B6, 0xFF7C4DFF, 0xFFFF6D00, 0xFFFF4081, 0xFF40C4FF];
+            static const _bgs = [0xFF090B10, 0xFF0D131F, 0xFF120E1E, 0xFF0A1412];
+
+            @override
+            void dispose() {
+              _brand.dispose(); _fileName.dispose(); _welcome.dispose();
+              _wkH.dispose(); _wkM.dispose(); _totH.dispose(); _totM.dispose(); _expD.dispose();
+              for (final c in _extCtrls.values) { c.dispose(); }
+              super.dispose();
+            }
+
+            Future<void> _pickSlot(VaultSlot slot) async {
+              final files = await FilePicker.pickFiles(type: FileType.any);
+              for (final f in files) {
+                if (f.path != null) { await widget.controller.vault.importToSlot(File(f.path!), slot); }
+              }
+              if (mounted) { setState(() {}); }
+            }
+
+            Future<void> _pickIcon() async {
+              final files = await FilePicker.pickFiles(type: FileType.image);
+              if (files.isNotEmpty && files.first.path != null) {
+                setState(() => _customIconPng = File(files.first.path!));
+              }
+            }
+
+            File? _slotFile(VaultSlot s) {
+              final a = widget.controller.vault.firstInSlot(s);
+              return a == null ? null : File(a.storedPath);
+            }
+
+            Future<void> _export() async {
+              setState(() { _busy = true; _logs.clear(); _exported = []; });
+              final axg = _slotFile(VaultSlot.modelAxg);
+              final axn = _slotFile(VaultSlot.modelAxn);
+              final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+              final expD = int.tryParse(_expD.text) ?? 0;
+              final wkSec = ((int.tryParse(_wkH.text) ?? 0) * 3600) + ((int.tryParse(_wkM.text) ?? 0) * 60);
+              final totSec = ((int.tryParse(_totH.text) ?? 0) * 3600) + ((int.tryParse(_totM.text) ?? 0) * 60);
+
+              final cfg = LicenseConfig(
+                brandName: _brand.text.trim().isEmpty ? 'Axon Studio' : _brand.text.trim(),
+                edition: _edition, scope: _scope,
+                maxTotalSeconds: totSec, maxWeeklySeconds: wkSec,
+                expiresUnix: expD > 0 ? now + expD * 86400 : 0,
+                lockModels: _lockModels, allowedModes: _modes.toList(),
+                bundledAxg: axg?.uri.pathSegments.last ?? '',
+                bundledAxn: axn != null && !axn.path.toLowerCase().endsWith('.safetensors') ? axn.uri.pathSegments.last : '',
+                bundledSafetensors: axn != null && axn.path.toLowerCase().endsWith('.safetensors') ? axn.uri.pathSegments.last : '',
+                issuedUnix: now, nonce: HmacLicenseService.generateNonce(),
+                uiCustom: UiCustomConfig(
+                  accentArgb: _accentArgb, bgArgb: _bgArgb, symbolId: _symbolId,
+                  allowChat: true, allowBench: _allowBench, allowServer: _allowServer,
+                  defaultRtl: _defaultRtl, hasCustomIcon: _customIconPng != null,
+                  welcomeText: _welcome.text.trim().isEmpty ? 'Axon Studio' : _welcome.text.trim(),
+                  allowedOs: _allowedOs.toList(),
+                ),
+              );
+
+              final workDir = Directory('${AppPaths.appDataDir().path}${Platform.pathSeparator}exports');
+              try {
+                final files = await MultiTargetExporter().exportAll(
+                  BuildAssetsRequest(
+                    unsignedLicense: cfg, targets: _targets,
+                    customExts: {for (final e in _extCtrls.entries) e.key: e.value.text},
+                    customBaseName: _fileName.text.trim(),
+                    workDir: workDir,
+                    axgFile: axg,
+                    axnFile: axn != null && !axn.path.toLowerCase().endsWith('.safetensors') ? axn : null,
+                    safetensorsFile: axn != null && axn.path.toLowerCase().endsWith('.safetensors') ? axn : null,
+                    windowsBinary: _slotFile(VaultSlot.winEngine),
+                    linuxBinary: _slotFile(VaultSlot.linuxEngine),
+                    macBinary: _slotFile(VaultSlot.macEngine),
+                    androidSo: _slotFile(VaultSlot.androidSo),
+                    iosArm64A: _slotFile(VaultSlot.iosArm64),
+                    iosSimA: _slotFile(VaultSlot.iosSim),
+                    extraAndroidFiles: widget.controller.vault.filesInSlot(VaultSlot.androidSdk),
+                    extraIosFiles: widget.controller.vault.filesInSlot(VaultSlot.iosSdk),
+                    iconPng: _customIconPng,
+                  ),
+                  (l) { if (mounted) { setState(() => _logs.add(l)); } },
+                );
+                if (mounted) { setState(() => _exported = files); }
+              } catch (e) {
+                if (mounted) { setState(() => _logs.add('❌ خطا: $e')); }
+              } finally {
+                if (mounted) { setState(() => _busy = false); }
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              if (AppConfig.isEndUserBuild) { return const SizedBox.shrink(); }
+              final vault = widget.controller.vault;
+              return ListView(padding: const EdgeInsets.all(14), children: [
+                GlassCard(
+                  borderColor: Color(_accentArgb).withValues(alpha: 0.45),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('۱. جایگاه دائمی موتورهای اصلی و SDK های کامپایل‌شده شما', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Color(_accentArgb))),
+                    const SizedBox(height: 6),
+                    const Text('هر موتور را در جایگاه خودش قرار دهید تا برای همیشه ذخیره بماند (لینوکس و مک جدا ذخیره می‌شوند):', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                    const SizedBox(height: 10),
+                    ...VaultSlot.values.map((slot) {
+                      final items = vault.items.where((i) => i.slotId == slot.id).toList();
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.04), borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.white.withValues(alpha: 0.07))),
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Row(children: [
+                            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              Text(slot.titleFa, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                              Text('مثال: ${slot.hintFile}', textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                            ])),
+                            FilledButton.tonalIcon(onPressed: () => _pickSlot(slot), icon: const Icon(Icons.upload_file, size: 17), label: const Text('انتخاب')),
+                          ]),
+                          if (items.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            Wrap(spacing: 6, runSpacing: 4, children: items.map((a) => InputChip(
+                              label: Text('${a.name} (${(a.sizeBytes / 1024).toStringAsFixed(1)} KB)', style: const TextStyle(fontSize: 11)),
+                              onDeleted: () async { await vault.deleteAsset(a); setState(() {}); },
+                            )).toList()),
+                          ],
+                        ]),
+                      );
+                    }),
+                  ]),
+                ),
+                const SizedBox(height: 12),
+                GlassCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('۲. شخصی‌سازی کامل ظاهر، نماد، رنگ و آیکون برنامه', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(child: TextField(controller: _brand, decoration: const InputDecoration(labelText: 'نام برند/اپلیکیشن', border: OutlineInputBorder()))),
+                    const SizedBox(width: 8),
+                    Expanded(child: TextField(controller: _fileName, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'نام فایل خروجی', border: OutlineInputBorder()))),
+                  ]),
+                  const SizedBox(height: 10),
+                  TextField(controller: _welcome, decoration: const InputDecoration(labelText: 'متن صفحه خوش‌آمدگویی', border: OutlineInputBorder())),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    if (_customIconPng != null) Padding(padding: const EdgeInsets.only(left: 10), child: ClipRRect(borderRadius: BorderRadius.circular(10), child: Image.file(_customIconPng!, width: 42, height: 42, fit: BoxFit.cover))),
+                    Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.image_rounded), label: Text(_customIconPng == null ? 'انتخاب آیکون PNG دلخواه (اختیاری)' : 'تغییر آیکون انتخاب‌شده'))),
+                  ]),
+                  const SizedBox(height: 10),
+                  const Text('نماد سرصفحه:', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                  const SizedBox(height: 6),
+                  Wrap(spacing: 6, children: List.generate(kAxonSymbols.length, (i) => ChoiceChip(selected: _symbolId == i, label: Icon(kAxonSymbols[i], size: 18), onSelected: (_) => setState(() => _symbolId = i)))),
+                  const SizedBox(height: 10),
+                  const Text('رنگ اصلی تم:', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                  const SizedBox(height: 6),
+                  Wrap(spacing: 8, children: _accents.map((col) => GestureDetector(onTap: () => setState(() => _accentArgb = col), child: CircleAvatar(radius: 15, backgroundColor: Color(col), child: _accentArgb == col ? const Icon(Icons.check, size: 16, color: Colors.black) : null))).toList()),
+                  const SizedBox(height: 10),
+                  const Text('رنگ پس‌زمینه:', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                  const SizedBox(height: 6),
+                  Wrap(spacing: 8, children: _bgs.map((col) => GestureDetector(onTap: () => setState(() => _bgArgb = col), child: CircleAvatar(radius: 15, backgroundColor: Color(col), child: _bgArgb == col ? const Icon(Icons.check, size: 16, color: Colors.white) : null))).toList()),
+                  SwitchListTile(value: _defaultRtl, onChanged: (v) => setState(() => _defaultRtl = v), title: const Text('زبان پیش‌فرض فارسی (راست‌به‌چپ)')),
+                  SwitchListTile(value: _allowBench, onChanged: (v) => setState(() => _allowBench = v), title: const Text('نمایش بنچمارک سخت‌افزار در خروجی')),
+                  SwitchListTile(value: _allowServer, onChanged: (v) => setState(() => _allowServer = v), title: const Text('امکان اتصال به سرور خارجی در خروجی')),
+                ])),
+                const SizedBox(height: 12),
+                GlassCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('۳. ساعت، دقیقه، انقضا و سیستم‌عامل‌های مجاز', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(child: DropdownButtonFormField<QuotaScope>(initialValue: _scope, decoration: const InputDecoration(labelText: 'محدوده سهمیه', border: OutlineInputBorder()), items: QuotaScope.values.map((s) => DropdownMenuItem(value: s, child: Text(s.labelFa))).toList(), onChanged: (v) => setState(() => _scope = v ?? QuotaScope.serverOnly))),
+                    const SizedBox(width: 8),
+                    DropdownButton<String>(value: _edition, items: const [DropdownMenuItem(value: 'standard', child: Text('Standard')), DropdownMenuItem(value: 'pro', child: Text('Pro'))], onChanged: (v) => setState(() => _edition = v ?? 'pro')),
+                  ]),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(child: TextField(controller: _wkH, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'ساعت هفتگی', border: OutlineInputBorder()))),
+                    const SizedBox(width: 6),
+                    Expanded(child: TextField(controller: _wkM, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'دقیقه هفتگی', border: OutlineInputBorder()))),
+                    const SizedBox(width: 6),
+                    Expanded(child: TextField(controller: _expD, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'روز انقضا', border: OutlineInputBorder()))),
+                  ]),
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    Expanded(child: TextField(controller: _totH, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'کل ساعات مجاز', border: OutlineInputBorder()))),
+                    const SizedBox(width: 6),
+                    Expanded(child: TextField(controller: _totM, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'دقیقه کل', border: OutlineInputBorder()))),
+                  ]),
+                  SwitchListTile(value: _lockModels, onChanged: (v) => setState(() => _lockModels = v), title: const Text('قفل کردن تغییر/آپلود مدل در خروجی')),
+                  const Text('موتورهای مجاز:', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                  Wrap(spacing: 6, children: AxonMode.values.map((m) => FilterChip(selected: _modes.contains(m.wire), label: Text(m.title), onSelected: (v) { setState(() { if (v) { _modes.add(m.wire); } else if (_modes.length > 1) { _modes.remove(m.wire); } }); })).toList()),
+                  const SizedBox(height: 8),
+                  const Text('اجازه اجرا روی کدام سیستم‌عامل‌ها؟', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                  Wrap(spacing: 6, children: ['android', 'windows', 'linux', 'macos', 'ios'].map((os) => FilterChip(selected: _allowedOs.contains(os), label: Text(os.toUpperCase()), onSelected: (v) { setState(() { if (v) { _allowedOs.add(os); } else if (_allowedOs.length > 1) { _allowedOs.remove(os); } }); })).toList()),
+                ])),
+                const SizedBox(height: 12),
+                GlassCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('۴. انتخاب خروجی‌ها و پسوند دلخواه هر کدام', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                  const SizedBox(height: 8),
+                  ...BuildTarget.values.map((t) => Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Row(children: [
+                      Checkbox(value: _targets.contains(t), onChanged: (v) { setState(() { if (v == true) { _targets.add(t); } else { _targets.remove(t); } }); }),
+                      Expanded(flex: 3, child: Text(t.title, style: const TextStyle(fontSize: 13))),
+                      const SizedBox(width: 6),
+                      Expanded(flex: 2, child: TextField(controller: _extCtrls[t], textDirection: TextDirection.ltr, decoration: const InputDecoration(isDense: true, labelText: 'پسوند', border: OutlineInputBorder()))),
+                    ]),
+                  )),
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: _busy || _targets.isEmpty ? null : _export,
+                      icon: const Icon(Icons.rocket_launch),
+                      label: Text(_busy ? 'در حال بسته‌بندی و امضای خروجی‌ها...' : 'ساخت تک‌فایل‌های خروجی و ذخیره در Downloads'),
+                    ),
+                  ),
+                  if (_exported.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Wrap(spacing: 8, runSpacing: 8, children: _exported.map((e) => FilledButton.tonalIcon(
+                      onPressed: () => widget.controller.mobileBridge.installOrShareFile(e.internalPath, mimeType: e.mimeType),
+                      icon: Icon(e.internalPath.endsWith('.apk') ? Icons.install_mobile_rounded : Icons.share_rounded),
+                      label: Text(e.label),
+                    )).toList()),
+                  ],
+                  if (_logs.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    Container(height: 170, width: double.infinity, padding: const EdgeInsets.all(10), color: Colors.black54, child: SingleChildScrollView(child: SelectableText(_logs.join('\n'), textDirection: TextDirection.ltr, style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: Color(0xFF1DE9B6))))),
+                  ],
+                ])),
+              ]);
+            }
+          }
+          """)
+
+          wf("lib/main.dart", r"""
+          import 'package:flutter/services.dart';
+          import 'package:material_ui/material_ui.dart';
+          import 'app_config.dart';
+          import 'security/security.dart';
+          import 'state/studio_controller.dart';
+          import 'ui/screens.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const AxonStudioApp());
+          }
+
+          class AxonStudioApp extends StatefulWidget {
+            const AxonStudioApp({super.key});
+            @override State<AxonStudioApp> createState() => _AxonStudioAppState();
+          }
+
+          class _AxonStudioAppState extends State<AxonStudioApp> {
+            final StudioController _controller = StudioController();
+
+            @override
+            void initState() {
+              super.initState();
+              WidgetsBinding.instance.addPostFrameCallback((_) => _controller.initialize());
+            }
+
+            @override
+            void dispose() { _controller.dispose(); super.dispose(); }
+
+            @override
+            Widget build(BuildContext context) {
+              return AnimatedBuilder(
+                animation: _controller,
+                builder: (_, __) {
+                  final accent = Color(_controller.uiCustom.accentArgb);
+                  final bg = Color(_controller.uiCustom.bgArgb);
+                  return MaterialApp(
+                    debugShowCheckedModeBanner: false,
+                    title: _controller.licenseConfig?.brandName ?? AppConfig.brandName,
+                    themeMode: ThemeMode.dark,
+                    darkTheme: ThemeData(
+                      brightness: Brightness.dark,
+                      scaffoldBackgroundColor: bg,
+                      colorScheme: ColorScheme.fromSeed(seedColor: accent, brightness: Brightness.dark, surface: const Color(0xFF121722)),
+                      useMaterial3: true,
+                    ),
+                    home: StudioShell(controller: _controller),
+                  );
+                },
+              );
+            }
+          }
+
+          class StudioShell extends StatefulWidget {
+            final StudioController controller;
+            const StudioShell({super.key, required this.controller});
+            @override State<StudioShell> createState() => _ShellState();
+          }
+
+          class _ShellState extends State<StudioShell> {
+            int _idx = 0;
+
+            Future<void> _openAdmin() async {
+              if (AppConfig.isEndUserBuild) { return; }
+              if (widget.controller.adminUnlocked) { setState(() => _idx = 3); return; }
+              final pc = TextEditingController();
+              final ok = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('ورود به بخش مخفی Admin Builder'),
+                  content: TextField(controller: pc, obscureText: true, autofocus: true, onSubmitted: (_) => Navigator.pop(ctx, AdminAuth.verifyPassword(pc.text)), decoration: const InputDecoration(labelText: 'رمز عبور', border: OutlineInputBorder())),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('انصراف')),
+                    FilledButton(onPressed: () => Navigator.pop(ctx, AdminAuth.verifyPassword(pc.text)), child: const Text('ورود')),
+                  ],
+                ),
+              );
+              pc.dispose();
+              if (ok == true && mounted) {
+                setState(() { widget.controller.adminUnlocked = true; _idx = 3; });
+              } else if (ok == false && mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('رمز اشتباه است.')));
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final c = widget.controller;
+              final accent = Color(c.uiCustom.accentArgb);
+              final sym = kAxonSymbols[c.uiCustom.symbolId.clamp(0, kAxonSymbols.length - 1)];
+              final wide = MediaQuery.sizeOf(context).width >= 860;
+              final pages = [
+                ChatWorkspaceScreen(controller: c),
+                EngineSettingsScreen(controller: c),
+                ServerConnectScreen(controller: c),
+                if (!AppConfig.isEndUserBuild) AdminBuilderScreen(controller: c),
+              ];
+              final body = Directionality(
+                textDirection: c.isRtl ? TextDirection.rtl : TextDirection.ltr,
+                child: Scaffold(
+                  appBar: AppBar(
+                    backgroundColor: const Color(0xFF0D1119),
+                    title: Row(children: [
+                      if (c.customBrandIconFile != null)
+                        ClipRRect(borderRadius: BorderRadius.circular(6), child: Image.file(c.customBrandIconFile!, width: 24, height: 24, fit: BoxFit.cover))
+                      else
+                        Icon(sym, color: accent),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(c.licenseConfig?.brandName ?? AppConfig.brandName, overflow: TextOverflow.ellipsis)),
+                    ]),
+                    actions: [
+                      TextButton(onPressed: c.toggleLanguage, child: Text(c.isRtl ? 'EN' : 'FA')),
+                      if (!AppConfig.isEndUserBuild)
+                        IconButton(tooltip: 'Admin Builder', icon: Icon(c.adminUnlocked ? Icons.verified_user : Icons.vpn_key_rounded, color: c.adminUnlocked ? const Color(0xFF1DE9B6) : Colors.white60), onPressed: _openAdmin),
+                    ],
+                  ),
+                  body: Row(children: [
+                    if (wide)
+                      NavigationRail(
+                        backgroundColor: const Color(0xFF0D1119), selectedIndex: _idx.clamp(0, 2), onDestinationSelected: (i) => setState(() => _idx = i),
+                        labelType: NavigationRailLabelType.all,
+                        destinations: const [
+                          NavigationRailDestination(icon: Icon(Icons.chat_bubble_rounded), label: Text('چت')),
+                          NavigationRailDestination(icon: Icon(Icons.tune_rounded), label: Text('موتور')),
+                          NavigationRailDestination(icon: Icon(Icons.dns_rounded), label: Text('سرور')),
+                        ],
+                      ),
+                    Expanded(child: AnimatedSwitcher(duration: const Duration(milliseconds: 200), child: KeyedSubtree(key: ValueKey(_idx), child: pages[_idx]))),
+                  ]),
+                  bottomNavigationBar: wide ? null : NavigationBar(
+                    selectedIndex: _idx.clamp(0, 2), onDestinationSelected: (i) => setState(() => _idx = i),
+                    destinations: const [
+                      NavigationDestination(icon: Icon(Icons.chat_bubble_rounded), label: 'چت'),
+                      NavigationDestination(icon: Icon(Icons.tune_rounded), label: 'موتور'),
+                      NavigationDestination(icon: Icon(Icons.dns_rounded), label: 'سرور'),
+                    ],
+                  ),
+                ),
+              );
+              if (AppConfig.isEndUserBuild) { return body; }
+              return CallbackShortcuts(bindings: {const SingleActivator(LogicalKeyboardKey.keyA, control: true, shift: true): _openAdmin}, child: Focus(autofocus: true, child: body));
+            }
+          }
+          """)
+
+      - name: Rebuild Upgraded End-User Android Template & Master Pro APK (With Working Password)
+        working-directory: axon_studio_app
+        env:
+          RAW_PASS: ${{ github.event.inputs.admin_password || secrets.AXON_ADMIN_PASSWORD || 'mohsen@1390' }}
+        run: |
+          set -e
+          yes | flutter doctor --android-licenses >/dev/null 2>&1 || true
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+          flutter test
+
+          # ۱) بازسازی تمپلیت End-User اندروید با امکانات شخصی‌سازی و .axpkg
+          flutter build apk --release --target-platform android-arm64 \
+            --dart-define=AXON_ENDUSER_BUILD=true \
+            --dart-define=AXON_LICENSE_HMAC_KEY="${{ env.HMAC_KEY }}"
+          cp build/app/outputs/flutter-apk/app-release.apk assets/templates/android-enduser.apk
+
+          # ۲) تولید قطعی هش PBKDF2 رمز در همین Runner (بدون باگ Skip output)
+          HASH_OUT=$(dart run tool/gen_admin_hash.dart "$RAW_PASS")
+          ADMIN_SALT=$(echo "$HASH_OUT" | grep AXON_ADMIN_SALT | cut -d= -f2)
+          ADMIN_PBKDF2=$(echo "$HASH_OUT" | grep AXON_ADMIN_PBKDF2 | cut -d= -f2)
+          echo "Checking Admin PBKDF2 hash lengths: salt=${#ADMIN_SALT}, hash=${#ADMIN_PBKDF2}"
+          test "${#ADMIN_SALT}" -eq 32
+          test "${#ADMIN_PBKDF2}" -eq 64
+
+          # ۳) جاسازی تمام تمپلیت‌ها و ساخت APK نهایی Master Pro
+          rm -f assets/templates/placeholder.txt
+          grep -q "assets/templates/" pubspec.yaml || printf "    - assets/templates/\n" >> pubspec.yaml
+          flutter pub get
+          flutter build apk --release --target-platform android-arm64 \
+            --dart-define=AXON_ENDUSER_BUILD=false \
+            --dart-define=AXON_LICENSE_HMAC_KEY="${{ env.HMAC_KEY }}" \
+            --dart-define=AXON_ADMIN_SALT="$ADMIN_SALT" \
+            --dart-define=AXON_ADMIN_PBKDF2="$ADMIN_PBKDF2"
+
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk dist/AxonStudio-Pro-Master-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AxonStudio-Pro-Master-android
+          path: axon_studio_app/dist/AxonStudio-Pro-Master-arm64.apk
